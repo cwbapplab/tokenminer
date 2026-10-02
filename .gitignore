@@ -1,0 +1,51 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.nupkg
+*.snupkg
+project.lock.json
+artifacts/
+
+# Rider / VS Code
+.idea/
+.vscode/
+
+# Build & test output
+[Dd]ebug/
+[Rr]elease/
+TestResults/
+*.trx
+coverage/
+*.coverage
+
+# EF Core
+*.dbmdl
+Migrations/**/*.Designer.cs.bak
+
+# Rust
+/stratum-proxy/target/
+
+# Node (client)
+node_modules/
+dist/
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+appsettings.Local.json
+appsettings.*.Local.json
+*.pfx
+*.pem
+*.key
+
+# Playwright
+playwright/.cache/
+ms-playwright/
+
+# OS
+.DS_Store
+Thumbs.db

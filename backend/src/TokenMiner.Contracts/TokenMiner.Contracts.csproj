@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>TokenMiner.Contracts</RootNamespace>
+    <AssemblyName>TokenMiner.Contracts</AssemblyName>
+  </PropertyGroup>
+
+</Project>

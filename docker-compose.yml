@@ -1,0 +1,64 @@
+name: tokenminer
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: tokenminer-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tokenminer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tokenminer}
+      POSTGRES_DB: ${POSTGRES_DB:-tokenminer}
+    ports:
+      # Host port 5433 by default: 5432 is commonly taken by a native local
+      # PostgreSQL install. Override with POSTGRES_PORT.
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-tokenminer} -d ${POSTGRES_DB:-tokenminer}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --- Full stack (Phase 5+). Start with: docker compose --profile full up ---
+  stratum-proxy:
+    build:
+      context: ./stratum-proxy
+      dockerfile: Dockerfile
+    container_name: tokenminer-stratum-proxy
+    profiles: ["full"]
+    restart: unless-stopped
+    environment:
+      # The API normally runs on the host during development.
+      TOKENMINER_API_BASE_URL: ${TOKENMINER_API_BASE_URL:-http://host.docker.internal:5210}
+      # Must match the API's Mining:ServiceSharedSecret.
+      TOKENMINER_SERVICE_SECRET: ${MINING_SERVICE_SHARED_SECRET:-change-me}
+      STRATUM_LISTEN_ADDR: 0.0.0.0:3333
+      RUST_LOG: ${RUST_LOG:-info}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # Exposed only for direct debugging; nginx is the normal entry point.
+      - "3334:3333"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: tokenminer-nginx
+    profiles: ["full"]
+    depends_on:
+      - postgres
+      - stratum-proxy
+    ports:
+      - "3333:3333"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+
+volumes:
+  postgres_data:

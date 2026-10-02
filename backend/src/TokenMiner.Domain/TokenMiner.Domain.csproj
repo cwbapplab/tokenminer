@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>TokenMiner.Domain</RootNamespace>
+    <AssemblyName>TokenMiner.Domain</AssemblyName>
+  </PropertyGroup>
+
+</Project>

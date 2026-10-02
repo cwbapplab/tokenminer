@@ -1,0 +1,22 @@
+# Taste
+- Defaults to .NET (C#) for backend API services — explicitly asks to "create a dotnet api project" rather than picking a stack fresh each time. Confidence: 0.8
+- Prefers Rust (Tokio) for high-performance hot-path/network services (e.g. a Stratum proxy) instead of putting that work in the main API. Confidence: 0.7
+- Prefers PostgreSQL (run via Docker) as the primary database. Confidence: 0.6
+- Prefers Clean Architecture with multiple projects (Domain / Application / Infrastructure / Contracts / Api plus test projects) over a single project with folders. Confidence: 0.6
+- Security-first: secrets (exchange/API keys, pool passwords, OAuth secrets, signing keys) must never be stored as plaintext — they go in a secret store, with DB rows referencing only a credential key. Confidence: 0.7
+- Never trust client-supplied identity — user IDs must always be derived from the authenticated principal, not from request payloads/query params. Confidence: 0.7
+- Treats financial/state-changing operations as needing idempotency, immutable records, retry state, external transaction IDs, and audit trails; wants domain events modeled as separately retryable state machines rather than one big transaction. Confidence: 0.65
+- Wants external integrations behind abstractions/ports (e.g. an interface) so specific providers (browser automation fallbacks, exchanges) don't leak into the rest of the system. Confidence: 0.6
+- Standard account flow: Google OAuth sign-in + email validation + email OTP activation, with short-lived access tokens and refresh-token rotation. Confidence: 0.55
+- Prefers producing a written, phased implementation plan for review before writing code (uses plan mode; wants the approach agreed up front). Confidence: 0.7
+- Prefers the latest LTS version of runtimes/frameworks (e.g. .NET 10 over .NET 8) — explicitly corrected a plan to "use .NET 10 (latest LTS)". Confidence: 0.75
+- Wants design/plan documents to carry Mermaid diagrams, not just prose — asks for ER diagrams of the data model and flow/state diagrams of services and background jobs. Confidence: 0.7
+- Iterates on plans via line-level review comments and expects revisions applied in place to the same plan file (same path), then re-presented for review — not a new file or a fresh rewrite. Confidence: 0.55
+- Writes detailed upfront specifications (tables, endpoints, services) and expects the implementation to follow them. Confidence: 0.6
+- Prefers Tauri v2 + React for desktop/client apps, chosen with cross-platform reach in mind (intends to add web and Android targets later). Confidence: 0.55
+- Enforces invariants with database constraints/indexes (unique keys, partial unique indexes, composite primary keys) as the source of truth — e.g. idempotent dedup keys, "one active row per X" — rather than relying on application-level checks alone. Confidence: 0.55
+- Prefers extracting a shared base abstraction when several components repeat the same structure (e.g. a single periodic-job base class instead of three copies of the same loop). Confidence: 0.5
+- Values durable/cross-instance guarantees over in-process convenience for security mechanisms — e.g. replay-nonce tracking in a database table, not an in-memory cache, so a second instance can't be fooled. Confidence: 0.5
+- Drives phased work with a bare "continue": once a plan is approved they expect each phase to be implemented, verified (build + full test suite + lint), and summarised with explicit judgement calls before moving to the next phase, without further instruction. Confidence: 0.55
+- Holds a zero-warning bar for builds and lint — expects code to compile clean (0 errors / 0 warnings) and Rust code to pass `cargo clippy -- -D warnings`. Confidence: 0.5
+- Prefers uninterrupted end-to-end execution of a multi-phase plan: asks the agent to "proceed through ALL phases" and report a single consolidated summary at the very end, rather than pausing for confirmation or narrating each phase as it finishes. Confidence: 0.6
