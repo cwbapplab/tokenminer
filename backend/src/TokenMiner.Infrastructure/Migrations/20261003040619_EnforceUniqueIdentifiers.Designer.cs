@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using TokenMiner.Infrastructure.Persistence;
@@ -11,9 +12,11 @@ using TokenMiner.Infrastructure.Persistence;
 namespace TokenMiner.Infrastructure.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    partial class AppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20261003040619_EnforceUniqueIdentifiers")]
+    partial class EnforceUniqueIdentifiers
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -1348,9 +1351,12 @@ namespace TokenMiner.Infrastructure.Migrations
                     b.HasIndex("CoinId")
                         .HasDatabaseName("ix_pool_payouts_coin_id");
 
-                    b.HasIndex("PoolId", "TransactionHash")
+                    b.HasIndex("PoolId")
+                        .HasDatabaseName("ix_pool_payouts_pool_id");
+
+                    b.HasIndex("TransactionHash")
                         .IsUnique()
-                        .HasDatabaseName("ix_pool_payouts_pool_id_transaction_hash");
+                        .HasDatabaseName("ix_pool_payouts_transaction_hash");
 
                     b.HasIndex("Status", "UpdatedAt")
                         .HasDatabaseName("ix_pool_payouts_status_updated_at");

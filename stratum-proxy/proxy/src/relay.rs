@@ -2,13 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
-use sp_api_client::StratumWorker;
 use sp_protocol::{Message, METHOD_SET_DIFFICULTY, METHOD_SUBMIT};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::share::{self, PendingSubmit};
+use crate::share::{self, PendingSubmit, ShareContext};
 use crate::AppContext;
 
 /// Submissions awaiting the pool's verdict, keyed by the JSON-RPC request id.
@@ -22,14 +21,15 @@ pub async fn pump_up<R, W>(
     mut reader: R,
     mut writer: W,
     pending: PendingSubmits,
-    worker: Arc<StratumWorker>,
+    share: Arc<ShareContext>,
 ) -> anyhow::Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     while let Some(line) = sp_protocol::read_line(&mut reader).await? {
-        observe_submission(&line, &pending, &worker).await;
+        debug!("miner -> {line}");
+        observe_submission(&line, &pending, &share).await;
         sp_protocol::write_line(&mut writer, &line).await?;
     }
 
@@ -49,6 +49,7 @@ where
     W: AsyncWrite + Unpin,
 {
     while let Some(line) = sp_protocol::read_line(&mut reader).await? {
+        debug!("pool -> {line}");
         observe_verdict(&line, &pending, &difficulty, &context).await;
         sp_protocol::write_line(&mut writer, &line).await?;
     }
@@ -56,7 +57,7 @@ where
     Ok(())
 }
 
-async fn observe_submission(line: &str, pending: &PendingSubmits, worker: &Arc<StratumWorker>) {
+async fn observe_submission(line: &str, pending: &PendingSubmits, share: &Arc<ShareContext>) {
     let Ok(Message::Request(request)) = Message::parse(line) else {
         return;
     };
@@ -70,7 +71,6 @@ async fn observe_submission(line: &str, pending: &PendingSubmits, worker: &Arc<S
         return;
     };
 
-    let identifier = share::share_identifier(&worker.worker_id, &submit);
     let key = request.id.to_string();
 
     let mut pending = pending.lock().await;
@@ -83,14 +83,7 @@ async fn observe_submission(line: &str, pending: &PendingSubmits, worker: &Arc<S
         }
     }
 
-    pending.insert(
-        key,
-        PendingSubmit {
-            worker: Arc::clone(worker),
-            submit,
-            share_identifier: identifier,
-        },
-    );
+    pending.insert(key, PendingSubmit::new(Arc::clone(share), &submit));
 }
 
 async fn observe_verdict(

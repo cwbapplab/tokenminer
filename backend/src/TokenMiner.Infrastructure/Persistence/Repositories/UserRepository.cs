@@ -9,6 +9,12 @@ internal sealed class UserRepository(AppDbContext dbContext) : IUserRepository
     public Task<User?> GetByIdAsync(Guid id, CancellationToken cancellationToken) =>
         dbContext.Users.FirstOrDefaultAsync(user => user.Id == id, cancellationToken);
 
+    public async Task<IReadOnlyList<User>> ListAsync(int limit, CancellationToken cancellationToken) =>
+        await dbContext.Users
+            .OrderByDescending(user => user.CreatedAt)
+            .Take(limit)
+            .ToListAsync(cancellationToken);
+
     public Task<User?> GetByNormalizedEmailAsync(string normalizedEmail, CancellationToken cancellationToken) =>
         dbContext.Users.FirstOrDefaultAsync(user => user.NormalizedEmail == normalizedEmail, cancellationToken);
 

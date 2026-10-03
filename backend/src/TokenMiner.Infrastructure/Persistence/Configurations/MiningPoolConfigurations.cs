@@ -112,7 +112,8 @@ internal sealed class UserHardwareConfiguration : IEntityTypeConfiguration<UserH
             .HasForeignKey(hardware => hardware.UserId)
             .OnDelete(DeleteBehavior.Cascade);
 
-        // A device is identified per user by the GUID the client generates.
-        builder.HasIndex(hardware => new { hardware.UserId, hardware.HardwareId }).IsUnique();
+        // The hardware id is the device's identity: a client generates it and it is unique, so the
+        // same physical device is one row no matter which account is mining on it.
+        builder.HasIndex(hardware => hardware.HardwareId).IsUnique();
     }
 }

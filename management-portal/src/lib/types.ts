@@ -199,6 +199,48 @@ export interface ProviderDeposit {
   confirmedAt: string | null;
 }
 
+// --- Accounts -------------------------------------------------------------------------------
+
+export interface AdminUserSummary {
+  id: string;
+  email: string;
+  displayName: string | null;
+  status: string;
+  createdAt: string;
+  hardwareCount: number;
+  acceptedShares: number;
+  rejectedShares: number;
+}
+
+export interface AdminHardwareSession {
+  sessionId: string;
+  status: string;
+  poolId: string;
+  poolName: string;
+  coinId: string;
+  coinCode: string;
+  startedAt: string;
+  lastActivityAt: string;
+}
+
+export interface AdminUserHardware {
+  id: string;
+  hardwareId: string;
+  name: string | null;
+  status: string;
+  createdAt: string;
+  connectedAt: string | null;
+  acceptedShares: number;
+  rejectedShares: number;
+  activeSession: AdminHardwareSession | null;
+}
+
+export interface AdminUserDetail extends AdminUserSummary {
+  emailConfirmedAt: string | null;
+  updatedAt: string;
+  hardware: AdminUserHardware[];
+}
+
 // --- System ---------------------------------------------------------------------------------
 
 export interface SystemStatus {

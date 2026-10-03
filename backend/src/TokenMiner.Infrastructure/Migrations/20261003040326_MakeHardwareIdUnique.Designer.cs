@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using TokenMiner.Infrastructure.Persistence;
@@ -11,9 +12,11 @@ using TokenMiner.Infrastructure.Persistence;
 namespace TokenMiner.Infrastructure.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    partial class AppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20261003040326_MakeHardwareIdUnique")]
+    partial class MakeHardwareIdUnique
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -710,18 +713,15 @@ namespace TokenMiner.Infrastructure.Migrations
                     b.HasIndex("CoinId")
                         .HasDatabaseName("ix_user_mining_shares_coin_id");
 
-                    b.HasIndex("PoolId")
-                        .HasDatabaseName("ix_user_mining_shares_pool_id");
-
-                    b.HasIndex("ShareIdentifier")
-                        .IsUnique()
-                        .HasDatabaseName("ix_user_mining_shares_share_identifier");
-
                     b.HasIndex("UserHardwareId")
                         .HasDatabaseName("ix_user_mining_shares_user_hardware_id");
 
                     b.HasIndex("UserHardwareMinerId")
                         .HasDatabaseName("ix_user_mining_shares_user_hardware_miner_id");
+
+                    b.HasIndex("PoolId", "ShareIdentifier")
+                        .IsUnique()
+                        .HasDatabaseName("ix_user_mining_shares_pool_id_share_identifier");
 
                     b.HasIndex("RewardStatus", "CreatedAt")
                         .HasDatabaseName("ix_user_mining_shares_reward_status_created_at");
@@ -1044,10 +1044,6 @@ namespace TokenMiner.Infrastructure.Migrations
 
                     b.HasIndex("LlmProviderId")
                         .HasDatabaseName("ix_provider_deposits_llm_provider_id");
-
-                    b.HasIndex("TransactionHash")
-                        .IsUnique()
-                        .HasDatabaseName("ix_provider_deposits_transaction_hash");
 
                     b.HasIndex("Status", "UpdatedAt")
                         .HasDatabaseName("ix_provider_deposits_status_updated_at");

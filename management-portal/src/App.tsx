@@ -7,6 +7,7 @@ import { LoginPage } from './pages/LoginPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { ResourcePage } from './pages/ResourcePage';
 import { ConversionsPage, PoolPayoutsPage, ProviderDepositsPage } from './pages/LedgerPages';
+import { UserDetailPage, UserHardwarePage, UsersPage } from './pages/UserPages';
 import { SettingsPage } from './pages/SettingsPage';
 
 /** The portal is operator-only, so a session without the admin role never reaches a screen. */
@@ -69,6 +70,9 @@ export function App() {
               }
             >
               <Route path="/" element={<DashboardPage />} />
+              <Route path="/users" element={<UsersPage />} />
+              <Route path="/users/:userId" element={<UserDetailPage />} />
+              <Route path="/users/:userId/hardware" element={<UserHardwarePage />} />
               <Route path="/resources/:resourceKey" element={<ResourcePage />} />
               <Route path="/conversions" element={<ConversionsPage />} />
               <Route path="/pool-payouts" element={<PoolPayoutsPage />} />

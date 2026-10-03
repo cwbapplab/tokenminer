@@ -36,8 +36,7 @@ public static class InternalMiningEndpoints
     {
         var recorded = await sender.Send(
             new RecordShareCommand(
-                request.UserId,
-                request.UserHardwareId,
+                request.WorkerIdentifier,
                 request.PoolId,
                 request.CoinId,
                 request.ShareIdentifier,

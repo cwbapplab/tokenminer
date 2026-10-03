@@ -7,6 +7,9 @@ public interface IUserRepository
 {
     Task<User?> GetByIdAsync(Guid id, CancellationToken cancellationToken);
 
+    /// <summary>Newest accounts first, for the operator's user list.</summary>
+    Task<IReadOnlyList<User>> ListAsync(int limit, CancellationToken cancellationToken);
+
     Task<User?> GetByNormalizedEmailAsync(string normalizedEmail, CancellationToken cancellationToken);
 
     Task<User?> GetByGoogleSubAsync(string googleSub, CancellationToken cancellationToken);

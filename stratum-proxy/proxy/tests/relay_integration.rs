@@ -1,14 +1,15 @@
 //! End-to-end relay behaviour: a fake miner talks to the proxy, which fronts a mock pool and a
 //! mock TokenMiner API.
 //!
-//! The point of these tests is the one thing the proxy *acts* on: an accepted share is reported
-//! with a correctly signed request, and a rejected share is never reported at all.
+//! The proxy routes purely from the username and the in-memory routing table (no API call before
+//! dialing the pool). The one thing it *acts* on is an accepted share, which it reports with a
+//! correctly signed request; a rejected share is never reported.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -21,7 +22,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout, Instant};
 
 const SECRET: &str = "integration-secret";
-const WORKER_ID: &str = "user-1-hardware-1";
+const WALLET: &str = "krxYR9NJVQ";
+const SYSTEM_POOL_ID: &str = "mock-pool";
+
+// The pool-facing worker id: the device's hardware id in "N" form (32 chars).
+const WORKER: &str = "7ed82f7514bd4b1397183061e5e25a68";
+
+fn username() -> String {
+    format!("{WALLET}.{SYSTEM_POOL_ID}.{WORKER}")
+}
 
 #[derive(Clone, Default)]
 struct ApiState {
@@ -29,7 +38,7 @@ struct ApiState {
     shares: Arc<Mutex<Vec<Value>>>,
     /// Signatures that did not verify, so a signing regression fails loudly.
     rejected_signatures: Arc<Mutex<Vec<String>>>,
-    /// Set once the API has told the proxy about the pool endpoint.
+    /// The pool endpoint the routing table advertises.
     pool_endpoint: Arc<Mutex<String>>,
 }
 
@@ -46,34 +55,13 @@ async fn stratum_config(State(state): State<ApiState>) -> Json<Value> {
         "version": "1",
         "pools": [{
             "poolId": "pool-1",
-            "systemPoolId": "mock-pool",
+            "systemPoolId": SYSTEM_POOL_ID,
             "name": "Mock pool",
             "stratumEndpoint": endpoint,
-            "payoutAddress": "wallet",
+            "payoutAddress": WALLET,
             "coins": [{ "coinId": "coin-1", "code": "qtc" }]
         }]
     }))
-}
-
-async fn resolve_worker(Path(worker_id): Path<String>) -> (StatusCode, Json<Value>) {
-    if worker_id != WORKER_ID {
-        return (StatusCode::NOT_FOUND, Json(json!({ "detail": "unknown worker" })));
-    }
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "workerId": WORKER_ID,
-            "userId": "user-1",
-            "userHardwareId": "hardware-1",
-            "userHardwareMinerId": "session-1",
-            "poolId": "pool-1",
-            "stratumEndpoint": "unused.example:1",
-            "payoutAddress": "wallet",
-            "coinId": "coin-1",
-            "coinCode": "qtc"
-        })),
-    )
 }
 
 async fn record_share(
@@ -171,7 +159,6 @@ async fn spawn_stack(accept_submissions: bool) -> Stack {
 
     let router = Router::new()
         .route("/internal/stratum/config", get(stratum_config))
-        .route("/internal/stratum/workers/:worker_id", get(resolve_worker))
         .route("/internal/mining/shares", post(record_share))
         .with_state(state.clone());
 
@@ -213,7 +200,7 @@ fn encode(message: Value) -> Vec<u8> {
 }
 
 /// Runs one miner session: subscribe, authorize, then submit one share.
-async fn run_miner(proxy_addr: std::net::SocketAddr) -> Vec<Value> {
+async fn run_miner(proxy_addr: std::net::SocketAddr, user: &str) -> Vec<Value> {
     let stream = TcpStream::connect(proxy_addr).await.expect("connecting to the proxy");
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -223,7 +210,7 @@ async fn run_miner(proxy_addr: std::net::SocketAddr) -> Vec<Value> {
         .await
         .unwrap();
     write_half
-        .write_all(&encode(json!({"id":2,"method":"mining.authorize","params":["wallet.user-1-hardware-1","x"]})))
+        .write_all(&encode(json!({"id":2,"method":"mining.authorize","params":[user,"x"]})))
         .await
         .unwrap();
     write_half.flush().await.unwrap();
@@ -243,7 +230,7 @@ async fn run_miner(proxy_addr: std::net::SocketAddr) -> Vec<Value> {
         .write_all(&encode(json!({
             "id": 3,
             "method": "mining.submit",
-            "params": ["wallet.user-1-hardware-1", "job-1", "deadbeef", "65a1b2c3", "0a1b2c3d"]
+            "params": [user, "job-1", "deadbeef", "65a1b2c3", "0a1b2c3d"]
         })))
         .await
         .unwrap();
@@ -278,7 +265,7 @@ async fn wait_for_shares(state: &ApiState, expected: usize) -> Vec<Value> {
 async fn an_accepted_share_is_reported_with_a_valid_signature() {
     let stack = spawn_stack(true).await;
 
-    let responses = run_miner(stack.proxy_addr).await;
+    let responses = run_miner(stack.proxy_addr, &username()).await;
 
     // The pool's own verdict is handed straight back to the miner.
     assert_eq!(responses[2]["result"], json!(true));
@@ -293,8 +280,8 @@ async fn an_accepted_share_is_reported_with_a_valid_signature() {
 
     let share = &shares[0];
 
-    assert_eq!(share["userId"], json!("user-1"));
-    assert_eq!(share["userHardwareId"], json!("hardware-1"));
+    // The worker id comes from the username; the pool and coin from the routing table entry.
+    assert_eq!(share["workerIdentifier"], json!(WORKER));
     assert_eq!(share["poolId"], json!("pool-1"));
     assert_eq!(share["coinId"], json!("coin-1"));
     assert_eq!(share["jobId"], json!("job-1"));
@@ -303,7 +290,7 @@ async fn an_accepted_share_is_reported_with_a_valid_signature() {
 
     // The identifier is the deterministic proof-of-work tuple, computed the same way here.
     let expected_identifier = {
-        let canonical = "user-1-hardware-1|job-1|deadbeef|65a1b2c3|0a1b2c3d";
+        let canonical = format!("{WORKER}|job-1|deadbeef|65a1b2c3|0a1b2c3d");
         let digest = {
             use sha2::{Digest, Sha256};
             hex::encode_upper(Sha256::digest(canonical.as_bytes()))
@@ -321,7 +308,7 @@ async fn an_accepted_share_is_reported_with_a_valid_signature() {
 async fn a_rejected_share_is_never_reported() {
     let stack = spawn_stack(false).await;
 
-    let responses = run_miner(stack.proxy_addr).await;
+    let responses = run_miner(stack.proxy_addr, &username()).await;
 
     // The rejection reaches the miner unchanged...
     assert_eq!(responses[2]["error"][0], json!(23));
@@ -335,33 +322,61 @@ async fn a_rejected_share_is_never_reported() {
     );
 }
 
-#[tokio::test]
-async fn an_unknown_worker_is_refused() {
-    let stack = spawn_stack(true).await;
-
-    let stream = TcpStream::connect(stack.proxy_addr).await.unwrap();
+/// Sends one authorize and reads the proxy's single reply.
+async fn authorize(proxy_addr: std::net::SocketAddr, username: &str) -> Value {
+    let stream = TcpStream::connect(proxy_addr).await.unwrap();
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    let mut request = json!({
-        "id": 7,
-        "method": "mining.authorize",
-        "params": ["wallet.someone-else", "x"]
-    })
-    .to_string();
-    request.push('\n');
-
-    write_half.write_all(request.as_bytes()).await.unwrap();
+    write_half
+        .write_all(&encode(json!({"id":7,"method":"mining.authorize","params":[username,"x"]})))
+        .await
+        .unwrap();
+    write_half.flush().await.unwrap();
 
     let mut line = String::new();
     timeout(Duration::from_secs(5), reader.read_line(&mut line))
         .await
-        .expect("the proxy replies to an unknown worker")
+        .expect("the proxy replies to a refused authorize")
         .unwrap();
 
-    let response: Value = serde_json::from_str(line.trim()).unwrap();
+    serde_json::from_str::<Value>(line.trim()).unwrap()
+}
+
+#[tokio::test]
+async fn a_wallet_only_username_routes_by_the_wallet() {
+    let stack = spawn_stack(true).await;
+
+    // No pool segment: the wallet is unique to a pool, so it picks the pool.
+    let responses = run_miner(stack.proxy_addr, &format!("{WALLET}.{WORKER}")).await;
+
+    assert_eq!(responses[2]["result"], json!(true));
+
+    let shares = wait_for_shares(&stack.state, 1).await;
+
+    assert_eq!(shares.len(), 1, "a wallet-only username must still be reported");
+    assert_eq!(shares[0]["poolId"], json!("pool-1"));
+    assert_eq!(shares[0]["workerIdentifier"], json!(WORKER));
+}
+
+#[tokio::test]
+async fn an_unknown_wallet_is_refused() {
+    let stack = spawn_stack(true).await;
+
+    let response = authorize(stack.proxy_addr, &format!("some-other-wallet.{SYSTEM_POOL_ID}.{WORKER}")).await;
 
     assert_eq!(response["id"], json!(7));
     assert_eq!(response["error"][0], json!(24));
+    assert_eq!(response["error"][1], json!("unauthorised wallet"));
     assert_eq!(response["result"], json!(null));
+}
+
+#[tokio::test]
+async fn an_unknown_pool_is_refused() {
+    let stack = spawn_stack(true).await;
+
+    let response = authorize(stack.proxy_addr, &format!("{WALLET}.no-such-pool.{WORKER}")).await;
+
+    assert_eq!(response["error"][0], json!(24));
+    assert_eq!(response["error"][1], json!("unknown pool"));
 }

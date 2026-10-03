@@ -47,6 +47,7 @@ activation code to the API log, which is the easiest place to read them.
 | Screen | What it does |
 |---|---|
 | Dashboard | Live status, daily payout chart, conversions by state, recent activity. |
+| Users | Accounts with their client id, device count and accepted/rejected share counts. Select a user to see the hardware in use, or a device count to open the user's hardware list. |
 | Coins | Mined coins and stablecoins, with their last known price. |
 | Pools | Pools, their payout rail, mode and coin set. |
 | Algorithms | Miner launch configurations, priority and coin matching. |
@@ -87,9 +88,10 @@ including folding nested fields into their container.
 
 - **The ledgers are read-only on purpose.** Payouts, deposits and conversions are produced by the
   background pipeline; the only manual action is settling a conversion.
-- **No user, session or share screens.** The API has no admin endpoints for `users`,
-  `user_hardware_miners`, `user_mining_shares` or `mining_statistics` yet, so there is nothing to
-  drive them with. Adding those endpoints would be a backend change.
+- **The user, hardware and share views are read-only too.** They are driven by
+  `GET /api/admin/users` and `GET /api/admin/users/{id}`, which surface the account, its devices and
+  the terminal (accepted/redeemed and rejected) share counts per device. In-flight shares are not
+  counted; there is no admin endpoint for `mining_statistics` yet.
 - **The bundle is one chunk** (~375 KB gzipped), dominated by the charting library. Fine for an
   internal console; split it if the portal ever becomes public.
 - **Poppins is fetched from Google Fonts** at runtime and falls back to the system stack offline.

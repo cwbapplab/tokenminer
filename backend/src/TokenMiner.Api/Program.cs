@@ -70,6 +70,7 @@ app.MapHealthChecks("/health/ready", new HealthCheckOptions
 
 app.MapAuthEndpoints();
 app.MapAdminMiningEndpoints();
+app.MapAdminUserEndpoints();
 app.MapAdminTreasuryEndpoints();
 app.MapAdminProviderEndpoints();
 app.MapAdminSystemEndpoints();

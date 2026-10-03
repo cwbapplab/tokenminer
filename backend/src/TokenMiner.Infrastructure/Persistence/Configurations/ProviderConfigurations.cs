@@ -150,6 +150,9 @@ internal sealed class ProviderDepositConfiguration : IEntityTypeConfiguration<Pr
         builder.Property(deposit => deposit.IdempotencyKey).IsRequired().HasMaxLength(256);
         builder.HasIndex(deposit => deposit.IdempotencyKey).IsUnique();
 
+        // A deposit's on-chain transaction is unique. Nullable until it is broadcast.
+        builder.HasIndex(deposit => deposit.TransactionHash).IsUnique();
+
         builder.Property(deposit => deposit.Error).HasMaxLength(1024);
 
         builder.Property(deposit => deposit.CreatedAt).IsRequired();

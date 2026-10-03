@@ -40,7 +40,8 @@ internal sealed class PoolPayoutConfiguration : IEntityTypeConfiguration<PoolPay
             .HasForeignKey(payout => payout.CoinId)
             .OnDelete(DeleteBehavior.Restrict);
 
-        // Idempotency: a blockchain payout can only be recorded once per pool.
+        // Idempotency: a payout is identified by its transaction within a pool — the same on-chain
+        // transaction can be reported by more than one pool, so it is not globally unique.
         builder.HasIndex(payout => new { payout.PoolId, payout.TransactionHash }).IsUnique();
 
         builder.HasIndex(payout => new { payout.Status, payout.UpdatedAt });

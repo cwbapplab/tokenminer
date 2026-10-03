@@ -1,6 +1,7 @@
 using System.Text.Json;
 using FluentValidation;
 using MediatR;
+using TokenMiner.Application.Authentication.Abstractions;
 using TokenMiner.Application.Common.Abstractions;
 using TokenMiner.Application.Common.Exceptions;
 using TokenMiner.Application.Mining.Abstractions;
@@ -28,6 +29,7 @@ public sealed class StartMiningCommandValidator : AbstractValidator<StartMiningC
 /// </summary>
 internal sealed class StartMiningCommandHandler(
     IUserHardwareRepository hardware,
+    IUserRepository users,
     IMiningSessionRepository sessions,
     IPoolRepository pools,
     ICoinRepository coins,
@@ -41,15 +43,28 @@ internal sealed class StartMiningCommandHandler(
     {
         var now = timeProvider.GetUtcNow();
 
-        var device = await hardware.GetByUserAndHardwareIdAsync(
-            request.UserId,
-            request.HardwareId,
-            cancellationToken);
+        var device = await hardware.GetByHardwareIdAsync(request.HardwareId, cancellationToken);
 
         if (device is null)
         {
             device = new UserHardware(Guid.NewGuid(), request.UserId, request.HardwareId, name: null, now);
             hardware.Add(device);
+        }
+        else if (device.UserId != request.UserId)
+        {
+            // The hardware id is the device's identity. One first seen through a share carries a
+            // placeholder owner, so the real account starting mining on it takes ownership; a
+            // device already owned by another account is refused.
+            var owner = await users.GetByIdAsync(device.UserId, cancellationToken);
+
+            if (owner is { PasswordHash: null, GoogleSub: null })
+            {
+                device.AssignOwner(request.UserId, now);
+            }
+            else
+            {
+                throw new ConflictException("This device is registered to another account.");
+            }
         }
         else
         {
@@ -64,8 +79,9 @@ internal sealed class StartMiningCommandHandler(
         var (pool, poolDetails, coin) = await SelectPoolAsync(request.PoolId, cancellationToken);
         var (algorithm, configuration) = await SelectAlgorithmAsync(coin, cancellationToken);
 
-        // The worker identity is always derived server-side; a client can never choose it.
-        var workerIdentifier = $"{request.UserId}-{device.Id}";
+        // The worker identity is always derived server-side; a client can never choose it. The
+        // hardware id in "N" form is 32 chars, which is the pool's cap for a worker name.
+        var workerIdentifier = device.HardwareId.ToString("N");
 
         var session = new UserHardwareMiner(
             Guid.NewGuid(),

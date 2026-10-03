@@ -71,8 +71,6 @@ public sealed class MiningSessionEndpointsTests(ApiFactory factory)
         var setup = await MiningTestData.SeedAsync(admin);
         var hardwareId = Guid.NewGuid();
 
-        var profile = await client.GetFromJsonAsync<UserProfileResponse>("/api/auth/me");
-
         var response = await client.PostAsJsonAsync(
             "/api/mining/start",
             new StartMiningRequest(hardwareId, setup.Pool.Id));
@@ -85,8 +83,8 @@ public sealed class MiningSessionEndpointsTests(ApiFactory factory)
         session.CoinCode.Should().Be(setup.Coin.Code);
         session.AlgorithmCode.Should().Be(setup.Algo.Code);
 
-        // Worker identity is derived server-side from the authenticated user and the device.
-        session.WorkerId.Should().StartWith($"{profile!.Id}-");
+        // The worker identity is the device's hardware id in "N" form — 32 chars, the pool's cap.
+        session.WorkerId.Should().Be(hardwareId.ToString("N"));
 
         session.MinerCommand.Should().Contain($"--algo {setup.Algo.Code}");
         session.MinerCommand.Should().Contain("--stratum pool.example.com");
@@ -274,7 +272,7 @@ public sealed class MiningSessionEndpointsTests(ApiFactory factory)
     }
 
     [Fact]
-    public async Task UserCannotStartMiningForAnotherUsersDevice()
+    public async Task Start_OnADeviceOwnedByAnotherAccount_IsRefused()
     {
         var owner = await factory.CreateUserClientAsync();
         var intruder = await factory.CreateUserClientAsync();
@@ -282,18 +280,14 @@ public sealed class MiningSessionEndpointsTests(ApiFactory factory)
         var setup = await MiningTestData.SeedAsync(admin);
         var hardwareId = Guid.NewGuid();
 
-        await owner.PostAsJsonAsync("/api/mining/start", new StartMiningRequest(hardwareId, setup.Pool.Id));
+        (await owner.PostAsJsonAsync("/api/mining/start", new StartMiningRequest(hardwareId, setup.Pool.Id)))
+            .StatusCode.Should().Be(HttpStatusCode.OK);
 
-        // Same hardware GUID, different account: a separate device with its own session.
+        // The hardware id is the device's identity, so another account cannot take it over.
         var response = await intruder.PostAsJsonAsync(
             "/api/mining/start",
             new StartMiningRequest(hardwareId, setup.Pool.Id));
 
-        response.StatusCode.Should().Be(HttpStatusCode.OK);
-
-        var session = await response.Content.ReadFromJsonAsync<MiningSessionResponse>();
-        var ownerProfile = await owner.GetFromJsonAsync<UserProfileResponse>("/api/auth/me");
-
-        session!.WorkerId.Should().NotStartWith($"{ownerProfile!.Id}-");
+        response.StatusCode.Should().Be(HttpStatusCode.Conflict);
     }
 }

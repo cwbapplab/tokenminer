@@ -387,6 +387,7 @@ export function DataTable({
   onRetry,
   rowKey = 'id',
   actions,
+  onRowClick,
   emptyTitle = 'Nothing here yet',
   emptyMessage = 'Once data exists it will appear here.',
   emptyAction,
@@ -399,6 +400,8 @@ export function DataTable({
   onRetry: () => void;
   rowKey?: string;
   actions?: (row: Row) => ReactNode;
+  /** Makes the whole row selectable; interactive cells should stop propagation. */
+  onRowClick?: (row: Row) => void;
   emptyTitle?: string;
   emptyMessage?: string;
   emptyAction?: ReactNode;
@@ -433,7 +436,11 @@ export function DataTable({
         </thead>
         <tbody>
           {rows.map((row, index) => (
-            <tr key={String(row[rowKey] ?? index)}>
+            <tr
+              key={String(row[rowKey] ?? index)}
+              onClick={onRowClick ? () => onRowClick(row) : undefined}
+              style={onRowClick ? { cursor: 'pointer' } : undefined}
+            >
               {columns.map((column) => (
                 <td
                   key={column.key}

@@ -68,7 +68,18 @@ public interface IUserHardwareRepository
         Guid hardwareId,
         CancellationToken cancellationToken);
 
+    /// <summary>
+    /// The device a pool-facing worker id names. A client-generated hardware GUID is unique in
+    /// practice, so the hardware id alone resolves the device (and through it the user).
+    /// </summary>
+    Task<UserHardware?> GetByHardwareIdAsync(Guid hardwareId, CancellationToken cancellationToken);
+
     Task<IReadOnlyList<UserHardware>> ListByUserAsync(Guid userId, CancellationToken cancellationToken);
+
+    /// <summary>How many devices each of the given users owns, keyed by user id.</summary>
+    Task<IReadOnlyDictionary<Guid, int>> CountByUsersAsync(
+        IEnumerable<Guid> userIds,
+        CancellationToken cancellationToken);
 
     void Add(UserHardware hardware);
 }
@@ -86,6 +97,11 @@ public interface IMiningSessionRepository
     /// </summary>
     Task<UserHardwareMiner?> GetActiveByWorkerIdentifierAsync(
         string workerIdentifier,
+        CancellationToken cancellationToken);
+
+    /// <summary>The in-flight (running or paused) sessions for the given devices.</summary>
+    Task<IReadOnlyList<UserHardwareMiner>> ListActiveByHardwareIdsAsync(
+        IEnumerable<Guid> hardwareIds,
         CancellationToken cancellationToken);
 
     /// <summary>Running sessions whose last heartbeat is older than <paramref name="threshold"/>.</summary>

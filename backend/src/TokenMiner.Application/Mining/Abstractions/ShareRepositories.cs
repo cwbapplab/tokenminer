@@ -27,7 +27,23 @@ public interface IShareRepository
         CancellationToken cancellationToken);
 
     Task<int> CountByStatusAsync(ShareRewardStatus status, CancellationToken cancellationToken);
+
+    /// <summary>Terminal reward counts (accepted/redeemed and rejected) per user.</summary>
+    Task<IReadOnlyDictionary<Guid, ShareStatusCounts>> CountByUsersAsync(
+        IEnumerable<Guid> userIds,
+        CancellationToken cancellationToken);
+
+    /// <summary>Terminal reward counts (accepted/redeemed and rejected) per device.</summary>
+    Task<IReadOnlyDictionary<Guid, ShareStatusCounts>> CountByHardwareIdsAsync(
+        IEnumerable<Guid> hardwareIds,
+        CancellationToken cancellationToken);
 }
+
+/// <summary>
+/// The two share states the operator sees: <see cref="Accepted"/> folds in redeemed shares
+/// (an accepted share that has already been paid out), <see cref="Rejected"/> is terminal.
+/// </summary>
+public readonly record struct ShareStatusCounts(int Accepted, int Rejected);
 
 public interface IMiningStatisticRepository
 {

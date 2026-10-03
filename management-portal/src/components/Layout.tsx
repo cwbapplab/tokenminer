@@ -22,6 +22,10 @@ const NAVIGATION: NavGroup[] = [
     items: [{ to: '/', label: 'Dashboard', icon: 'dashboard' }],
   },
   {
+    title: 'Accounts',
+    items: [{ to: '/users', label: 'Users', icon: 'users' }],
+  },
+  {
     title: 'Mining',
     items: [
       { to: '/resources/coins', label: 'Coins', icon: 'coins' },

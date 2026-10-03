@@ -28,10 +28,30 @@ internal sealed class UserHardwareRepository(AppDbContext dbContext) : IUserHard
             hardware => hardware.UserId == userId && hardware.HardwareId == hardwareId,
             cancellationToken);
 
+    public Task<UserHardware?> GetByHardwareIdAsync(Guid hardwareId, CancellationToken cancellationToken) =>
+        dbContext.UserHardware.FirstOrDefaultAsync(
+            hardware => hardware.HardwareId == hardwareId,
+            cancellationToken);
+
     public async Task<IReadOnlyList<UserHardware>> ListByUserAsync(Guid userId, CancellationToken cancellationToken) =>
         await dbContext.UserHardware
             .Where(hardware => hardware.UserId == userId)
             .ToListAsync(cancellationToken);
+
+    public async Task<IReadOnlyDictionary<Guid, int>> CountByUsersAsync(
+        IEnumerable<Guid> userIds,
+        CancellationToken cancellationToken)
+    {
+        var ids = userIds.Distinct().ToList();
+
+        var counts = await dbContext.UserHardware
+            .Where(hardware => ids.Contains(hardware.UserId))
+            .GroupBy(hardware => hardware.UserId)
+            .Select(group => new { UserId = group.Key, Count = group.Count() })
+            .ToListAsync(cancellationToken);
+
+        return counts.ToDictionary(row => row.UserId, row => row.Count);
+    }
 
     public void Add(UserHardware hardware) => dbContext.UserHardware.Add(hardware);
 }

@@ -120,8 +120,8 @@ pub struct StratumWorker {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareReport {
-    pub user_id: String,
-    pub user_hardware_id: String,
+    /// The pool-facing worker id (the device's hardware id in "N" form); the API resolves it.
+    pub worker_identifier: String,
     pub pool_id: String,
     pub coin_id: String,
     pub share_identifier: String,
@@ -363,8 +363,7 @@ mod tests {
     #[test]
     fn share_reports_serialise_with_camel_case_names() {
         let report = ShareReport {
-            user_id: "u".into(),
-            user_hardware_id: "h".into(),
+            worker_identifier: "w".into(),
             pool_id: "p".into(),
             coin_id: "c".into(),
             share_identifier: "s".into(),
@@ -382,7 +381,7 @@ mod tests {
         let value = serde_json::to_value(&report).unwrap();
 
         assert!(value.get("shareIdentifier").is_some());
-        assert!(value.get("userHardwareId").is_some());
-        assert!(value.get("userId").is_some());
+        assert!(value.get("workerIdentifier").is_some());
+        assert!(value.get("poolId").is_some());
     }
 }

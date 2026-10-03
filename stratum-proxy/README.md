@@ -23,6 +23,47 @@ miner ──▶ nginx (TLS) ──▶ stratum proxy ──▶ pool
 The `.NET` API is never in the Stratum path: the proxy talks to it only to resolve a worker and
 to report accepted shares, both off the critical relay path.
 
+## Coin dialects
+
+The relay is verbatim, so it carries any Stratum dialect unchanged; parsing exists only to observe
+the worker and the shares. Two dialects are recognised:
+
+- **Classic** (positional): `mining.authorize ["wallet.worker","x"]` and
+  `mining.submit [worker, jobId, extranonce2, ntime, nonce]`.
+- **Pearl** (named params, no `mining.subscribe`): `mining.authorize {"wallet":…,"worker":…}`
+  and `mining.submit {"job_id":…,"plain_proof":…}`.
+
+A share's idempotency key is derived from the work — the nonce for classic, the `plain_proof` for
+Pearl — so re-submitting the same work collapses to one record.
+
+## Routing
+
+The username carries everything the proxy needs, so it never calls the API before dialing a pool:
+
+```
+wallet[.systemPoolId].worker      worker = <userId>-<hardwareId> (two canonical GUIDs)
+```
+
+- **Pool** — if a `systemPoolId` segment is present it must name a pool in the routing table; if it
+  is omitted the pool is inferred from the wallet (which must then be unique to one pool).
+- **Worker** — always the last dot-segment, split at the fixed GUID boundary into the user id and
+  the hardware id used to attribute the share.
+- **Endpoint** — taken from the routing table entry, in memory.
+
+## Wallet policy
+
+At startup the proxy loads the active pools and keeps a `coin -> wallet` map in memory (the wallet
+each active pool pays out to), refreshed with the routing table. On `mining.authorize`:
+
+1. The wallet — everything before the first dot of the username — must belong to one of those
+   pools, or the connection is refused from memory with `24` and never reaches a pool.
+2. Once the worker is resolved and its coin is known, the wallet must be exactly that coin's active
+   pool wallet; a mismatch is refused the same way.
+
+So a miner has to mine with the pool's own wallet; a wallet that would redirect payouts elsewhere
+cannot start a session. (The gate is skipped while no pool has a payout wallet configured, so an
+empty catalogue does not lock everyone out.)
+
 ## Layout
 
 | Crate | Responsibility |

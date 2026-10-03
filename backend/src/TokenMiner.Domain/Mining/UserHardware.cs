@@ -39,6 +39,16 @@ public sealed class UserHardware
 
     public void Touch(DateTimeOffset now) => LastSeenAt = now;
 
+    /// <summary>
+    /// Moves the device to another account. Used when a device first seen through a share (owned
+    /// by a placeholder) is claimed by the real account that starts mining on it.
+    /// </summary>
+    public void AssignOwner(Guid userId, DateTimeOffset now)
+    {
+        UserId = userId;
+        LastSeenAt = now;
+    }
+
     public void Update(string? name, MiningStatus status, DateTimeOffset now)
     {
         Name = name;

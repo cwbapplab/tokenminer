@@ -26,6 +26,18 @@ internal sealed class MiningSessionRepository(AppDbContext dbContext) : IMiningS
                 && (session.Status == MiningSessionStatus.Running || session.Status == MiningSessionStatus.Paused),
             cancellationToken);
 
+    public async Task<IReadOnlyList<UserHardwareMiner>> ListActiveByHardwareIdsAsync(
+        IEnumerable<Guid> hardwareIds,
+        CancellationToken cancellationToken)
+    {
+        var ids = hardwareIds.Distinct().ToList();
+
+        return await dbContext.UserHardwareMiners
+            .Where(session => ids.Contains(session.UserHardwareId)
+                && (session.Status == MiningSessionStatus.Running || session.Status == MiningSessionStatus.Paused))
+            .ToListAsync(cancellationToken);
+    }
+
     public async Task<IReadOnlyList<UserHardwareMiner>> ListRunningIdleSinceAsync(
         DateTimeOffset threshold,
         CancellationToken cancellationToken) =>

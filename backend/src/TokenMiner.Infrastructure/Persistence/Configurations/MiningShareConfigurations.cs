@@ -65,8 +65,8 @@ internal sealed class UserMiningShareConfiguration : IEntityTypeConfiguration<Us
             .HasForeignKey(share => share.CoinId)
             .OnDelete(DeleteBehavior.Restrict);
 
-        // Idempotency: a pool-side share can only ever be stored once.
-        builder.HasIndex(share => new { share.PoolId, share.ShareIdentifier }).IsUnique();
+        // Idempotency: a share identifier identifies exactly one share.
+        builder.HasIndex(share => share.ShareIdentifier).IsUnique();
 
         builder.HasIndex(share => new { share.UserId, share.CreatedAt });
         builder.HasIndex(share => new { share.RewardStatus, share.CreatedAt });

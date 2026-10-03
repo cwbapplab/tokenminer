@@ -126,6 +126,10 @@ impl Message {
 }
 
 /// A `mining.submit` observed on the way up to the pool.
+///
+/// The classic dialect is positional (`[worker, jobId, extranonce2, ntime, nonce, ...]`) and the
+/// nonce is the proof of work. Pearl's named dialect sends `{job_id, plain_proof}` with no worker
+/// or nonce, so the proof carries the work instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Submit {
     pub worker: String,
@@ -133,28 +137,103 @@ pub struct Submit {
     pub extranonce: Option<String>,
     pub ntime: Option<String>,
     pub nonce: String,
+    pub proof: Option<String>,
 }
 
-/// Extracts the positional `mining.submit` arguments.
-///
-/// Stratum submits are positional: `[worker, jobId, extranonce2, ntime, nonce, ...]`.
+/// Extracts the arguments of a `mining.submit`, in either dialect.
 pub fn parse_submit(params: &Value) -> Option<Submit> {
-    let values = params.as_array()?;
+    if let Some(values) = params.as_array() {
+        let text = |index: usize| {
+            values
+                .get(index)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
 
-    let text = |index: usize| {
-        values
-            .get(index)
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    };
+        return Some(Submit {
+            worker: text(0)?,
+            job_id: text(1)?,
+            extranonce: text(2),
+            ntime: text(3),
+            nonce: text(4)?,
+            proof: None,
+        });
+    }
+
+    // Pearl: `{ "job_id": "...", "plain_proof": "<base64>" }`.
+    let object = params.as_object()?;
 
     Some(Submit {
-        worker: text(0)?,
-        job_id: text(1)?,
-        extranonce: text(2),
-        ntime: text(3),
-        nonce: text(4)?,
+        worker: String::new(),
+        job_id: object.get("job_id").and_then(Value::as_str)?.to_string(),
+        extranonce: None,
+        ntime: None,
+        nonce: String::new(),
+        proof: Some(object.get("plain_proof").and_then(Value::as_str)?.to_string()),
     })
+}
+
+/// The username from a `mining.authorize`, in either dialect.
+///
+/// Classic is positional (`["wallet.worker", "x"]`). Pearl is named (`{"wallet": "...", "worker":
+/// "..."}`); a non-empty `worker` is joined to the wallet with a dot so the usual last-dot split
+/// yields the worker, and miners that glue `wallet.worker` into `wallet` work unchanged.
+pub fn authorize_username(params: &Value) -> Option<String> {
+    if let Some(values) = params.as_array() {
+        return values.first().and_then(Value::as_str).map(str::to_string);
+    }
+
+    let object = params.as_object()?;
+    let wallet = object.get("wallet").and_then(Value::as_str)?;
+
+    match object.get("worker").and_then(Value::as_str) {
+        Some(worker) if !worker.is_empty() => Some(format!("{wallet}.{worker}")),
+        _ => Some(wallet.to_string()),
+    }
+}
+
+/// The wallet address from a `mining.authorize`, in either dialect.
+///
+/// Pools treat everything before the first dot as the wallet and the rest as the worker, so the
+/// `wallet.worker` form and a separate `worker` field both reduce to the same address.
+pub fn authorize_wallet(params: &Value) -> Option<String> {
+    let username = authorize_username(params)?;
+
+    Some(match username.split_once('.') {
+        Some((wallet, _)) => wallet.to_string(),
+        None => username,
+    })
+}
+
+/// A `mining.authorize` username split into `wallet.systemPoolId.worker`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizeIdentity {
+    pub wallet: String,
+    /// The pool named in the username, absent for a bare `wallet.worker`.
+    pub pool: Option<String>,
+    /// The worker identity, `<userId>-<hardwareId>`.
+    pub worker: String,
+}
+
+/// Splits a username into wallet, pool and worker. The pool is the segments between the first and
+/// last dot, so `wallet.pool.worker` and `wallet.worker` both parse. The worker is opaque.
+pub fn parse_authorize(params: &Value) -> Option<AuthorizeIdentity> {
+    let username = authorize_username(params)?;
+    let mut segments = username.split('.');
+
+    let wallet = segments.next()?.to_string();
+    let rest: Vec<&str> = segments.collect();
+
+    let (pool, worker) = match rest.len() {
+        0 => (None, wallet.clone()),
+        1 => (None, rest[0].to_string()),
+        _ => (
+            Some(rest[..rest.len() - 1].join(".")),
+            rest[rest.len() - 1].to_string(),
+        ),
+    };
+
+    Some(AuthorizeIdentity { wallet, pool, worker })
 }
 
 /// Extracts the worker identity from a stratum username of the form `wallet.worker`.
@@ -287,6 +366,93 @@ mod tests {
     fn rejects_incomplete_submit_arguments() {
         assert!(parse_submit(&json!(["-acct.rig-1", "job-42"])).is_none());
         assert!(parse_submit(&json!("nope")).is_none());
+    }
+
+    #[test]
+    fn parses_a_pearl_named_submit() {
+        let params = json!({ "job_id": "18e4eadf_1", "plain_proof": "AAACAAAA" });
+
+        let submit = parse_submit(&params).expect("a submit");
+
+        assert_eq!(submit.job_id, "18e4eadf_1");
+        assert_eq!(submit.proof.as_deref(), Some("AAACAAAA"));
+        assert!(submit.nonce.is_empty());
+        assert!(submit.worker.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_named_submit_without_a_proof() {
+        assert!(parse_submit(&json!({ "job_id": "18e4eadf_1" })).is_none());
+    }
+
+    #[test]
+    fn parses_a_classic_positional_authorize() {
+        assert_eq!(
+            authorize_username(&json!(["krxYR9NJVQ.user-1", "x"])).as_deref(),
+            Some("krxYR9NJVQ.user-1")
+        );
+    }
+
+    #[test]
+    fn parses_a_pearl_named_authorize() {
+        assert_eq!(
+            authorize_username(&json!({ "wallet": "krxYR9NJVQ.pc-home", "worker": "" })).as_deref(),
+            Some("krxYR9NJVQ.pc-home")
+        );
+        assert_eq!(
+            authorize_username(&json!({ "wallet": "prl1paddr", "worker": "rig1" })).as_deref(),
+            Some("prl1paddr.rig1")
+        );
+    }
+
+    #[test]
+    fn a_named_authorize_without_a_wallet_is_none() {
+        assert!(authorize_username(&json!({ "worker": "rig1" })).is_none());
+    }
+
+    #[test]
+    fn reads_the_wallet_before_the_first_dot() {
+        assert_eq!(
+            authorize_wallet(&json!(["krxYR9NJVQ.user-1", "x"])).as_deref(),
+            Some("krxYR9NJVQ")
+        );
+        assert_eq!(
+            authorize_wallet(&json!({ "wallet": "krxYR9NJVQ.pc-home", "worker": "" })).as_deref(),
+            Some("krxYR9NJVQ")
+        );
+        assert_eq!(
+            authorize_wallet(&json!({ "wallet": "prl1paddr", "worker": "rig1" })).as_deref(),
+            Some("prl1paddr")
+        );
+        assert_eq!(
+            authorize_wallet(&json!(["barewallet", "x"])).as_deref(),
+            Some("barewallet")
+        );
+    }
+
+    #[test]
+    fn splits_a_three_part_username() {
+        let identity = parse_authorize(&json!([
+            "krxYR9NJVQ.kryptex-prl.11111111-1111-1111-1111-111111111111-22222222-2222-2222-2222-222222222222",
+            "x"
+        ]))
+        .expect("an identity");
+
+        assert_eq!(identity.wallet, "krxYR9NJVQ");
+        assert_eq!(identity.pool.as_deref(), Some("kryptex-prl"));
+        assert_eq!(
+            identity.worker,
+            "11111111-1111-1111-1111-111111111111-22222222-2222-2222-2222-222222222222"
+        );
+    }
+
+    #[test]
+    fn a_two_part_username_has_no_pool() {
+        let identity = parse_authorize(&json!(["krxYR9NJVQ.rig-1", "x"])).expect("an identity");
+
+        assert_eq!(identity.wallet, "krxYR9NJVQ");
+        assert!(identity.pool.is_none());
+        assert_eq!(identity.worker, "rig-1");
     }
 
     #[test]

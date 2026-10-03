@@ -62,16 +62,22 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
         return await dbContext.UserMiningShares.CountAsync(share => share.ShareIdentifier == shareIdentifier);
     }
 
+    private async Task<bool> DeviceExistsAsync(Guid hardwareId)
+    {
+        await using var scope = factory.Services.CreateAsyncScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        return await dbContext.UserHardware.AnyAsync(hardware => hardware.HardwareId == hardwareId);
+    }
+
     private static object SharePayload(
-        Guid userId,
-        Guid hardwareRowId,
+        string workerIdentifier,
         Guid poolId,
         Guid coinId,
         string shareIdentifier,
         decimal? coinValue = null) => new
     {
-        userId,
-        userHardwareId = hardwareRowId,
+        workerIdentifier,
         poolId,
         coinId,
         shareIdentifier,
@@ -125,7 +131,8 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
         HttpClient ServiceClient,
         MiningTestData.Setup Setup,
         Guid UserId,
-        Guid HardwareRowId);
+        Guid HardwareRowId,
+        Guid HardwareId);
 
     private async Task<Session> StartSessionAsync()
     {
@@ -142,7 +149,7 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
         var profile = await userClient.GetFromJsonAsync<UserProfileResponse>("/api/auth/me");
         var hardwareRowId = await ReadHardwareRowIdAsync(profile!.Id, hardwareId);
 
-        return new Session(userClient, factory.CreateClient(), setup, profile.Id, hardwareRowId);
+        return new Session(userClient, factory.CreateClient(), setup, profile.Id, hardwareRowId, hardwareId);
     }
 
     private async Task ProcessAndRollUpAsync()
@@ -173,7 +180,7 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
 
         var response = await PostShareAsync(
             session.ServiceClient,
-            SharePayload(session.UserId, session.HardwareRowId, session.Setup.Pool.Id, session.Setup.Coin.Id, "forged-1"),
+            SharePayload(session.HardwareId.ToString("N"), session.Setup.Pool.Id, session.Setup.Coin.Id, "forged-1"),
             secret: "not-the-real-secret");
 
         response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
@@ -186,7 +193,7 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
 
         var response = await PostShareAsync(
             session.ServiceClient,
-            SharePayload(session.UserId, session.HardwareRowId, session.Setup.Pool.Id, session.Setup.Coin.Id, "stale-1"),
+            SharePayload(session.HardwareId.ToString("N"), session.Setup.Pool.Id, session.Setup.Coin.Id, "stale-1"),
             timestamp: DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeSeconds());
 
         response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
@@ -200,7 +207,7 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
 
         var first = await PostShareAsync(
             session.ServiceClient,
-            SharePayload(session.UserId, session.HardwareRowId, session.Setup.Pool.Id, session.Setup.Coin.Id, "replay-1"),
+            SharePayload(session.HardwareId.ToString("N"), session.Setup.Pool.Id, session.Setup.Coin.Id, "replay-1"),
             nonce);
 
         first.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -208,7 +215,7 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
         // A different share, but signed with a nonce already spent.
         var second = await PostShareAsync(
             session.ServiceClient,
-            SharePayload(session.UserId, session.HardwareRowId, session.Setup.Pool.Id, session.Setup.Coin.Id, "replay-2"),
+            SharePayload(session.HardwareId.ToString("N"), session.Setup.Pool.Id, session.Setup.Coin.Id, "replay-2"),
             nonce);
 
         second.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
@@ -221,8 +228,7 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
         var shareIdentifier = $"share-{Guid.NewGuid():N}";
 
         var payload = SharePayload(
-            session.UserId,
-            session.HardwareRowId,
+            session.HardwareId.ToString("N"),
             session.Setup.Pool.Id,
             session.Setup.Coin.Id,
             shareIdentifier);
@@ -247,20 +253,26 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
     }
 
     [Fact]
-    public async Task Share_ForAnUnknownDevice_IsRejected()
+    public async Task Share_ForAnUnknownWorker_CreatesTheDeviceAndRecords()
     {
         var session = await StartSessionAsync();
+        var hardwareId = Guid.NewGuid();
+        var shareIdentifier = $"unknown-{Guid.NewGuid():N}";
 
+        // A worker the API has never seen: the device (with a placeholder owner) is created so the
+        // share is attributed rather than dropped.
         var response = await PostShareAsync(
             session.ServiceClient,
             SharePayload(
-                session.UserId,
-                Guid.NewGuid(),
+                hardwareId.ToString("N"),
                 session.Setup.Pool.Id,
                 session.Setup.Coin.Id,
-                $"unknown-{Guid.NewGuid():N}"));
+                shareIdentifier));
 
-        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        (await CountSharesAsync(shareIdentifier)).Should().Be(1);
+        (await DeviceExistsAsync(hardwareId)).Should().BeTrue();
     }
 
     [Fact]
@@ -277,8 +289,7 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
         var response = await PostShareAsync(
             session.ServiceClient,
             SharePayload(
-                session.UserId,
-                session.HardwareRowId,
+                session.HardwareId.ToString("N"),
                 session.Setup.Pool.Id,
                 otherCoin.Id,
                 $"unrelated-{Guid.NewGuid():N}"));
@@ -318,11 +329,11 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
         await SetCoinPriceAsync(session.Setup.Coin.Id, 2.5m);
 
         (await PostShareAsync(session.ServiceClient, SharePayload(
-            session.UserId, session.HardwareRowId, session.Setup.Pool.Id, session.Setup.Coin.Id,
+            session.HardwareId.ToString("N"), session.Setup.Pool.Id, session.Setup.Coin.Id,
             $"a-{Guid.NewGuid():N}", coinValue: 4m))).StatusCode.Should().Be(HttpStatusCode.OK);
 
         (await PostShareAsync(session.ServiceClient, SharePayload(
-            session.UserId, session.HardwareRowId, session.Setup.Pool.Id, session.Setup.Coin.Id,
+            session.HardwareId.ToString("N"), session.Setup.Pool.Id, session.Setup.Coin.Id,
             $"b-{Guid.NewGuid():N}", coinValue: 2m))).StatusCode.Should().Be(HttpStatusCode.OK);
 
         await ProcessAndRollUpAsync();
@@ -366,7 +377,7 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
             hardwareRowIds.Add(hardwareRowId);
 
             var response = await PostShareAsync(serviceClient, SharePayload(
-                profile.Id, hardwareRowId, setup.Pool.Id, setup.Coin.Id,
+                hardwareId.ToString("N"), setup.Pool.Id, setup.Coin.Id,
                 $"h-{Guid.NewGuid():N}", coinValue: amount));
 
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -393,7 +404,7 @@ public sealed class MiningShareEndpointsTests(ApiFactory factory)
         await SetCoinPriceAsync(owner.Setup.Coin.Id, 1m);
 
         (await PostShareAsync(owner.ServiceClient, SharePayload(
-            owner.UserId, owner.HardwareRowId, owner.Setup.Pool.Id, owner.Setup.Coin.Id,
+            owner.HardwareId.ToString("N"), owner.Setup.Pool.Id, owner.Setup.Coin.Id,
             $"o-{Guid.NewGuid():N}", coinValue: 5m))).StatusCode.Should().Be(HttpStatusCode.OK);
 
         await ProcessAndRollUpAsync();
