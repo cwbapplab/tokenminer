@@ -21,21 +21,30 @@ internal abstract class PeriodicJob(
     {
         using var timer = new PeriodicTimer(interval);
 
-        while (await timer.WaitForNextTickAsync(stoppingToken))
+        try
         {
-            try
+            while (await timer.WaitForNextTickAsync(stoppingToken))
             {
-                using var scope = scopeFactory.CreateScope();
-                await RunOnceAsync(scope.ServiceProvider, stoppingToken);
+                try
+                {
+                    using var scope = scopeFactory.CreateScope();
+                    await RunOnceAsync(scope.ServiceProvider, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception exception)
+                {
+                    logger.LogError(exception, "{Job} tick failed.", GetType().Name);
+                }
             }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception exception)
-            {
-                logger.LogError(exception, "{Job} tick failed.", GetType().Name);
-            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            // Waiting on the timer is where shutdown surfaces. Swallowing it here keeps a normal
+            // stop from looking like a crash: the host otherwise reports "a BackgroundService has
+            // thrown an unhandled exception, and the IHost instance is stopping".
         }
     }
 

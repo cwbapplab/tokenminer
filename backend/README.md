@@ -31,8 +31,24 @@ Related: [`../stratum-proxy`](../stratum-proxy) (Rust) and [`../deploy/nginx`](.
 
 ## Running
 
+One script brings the whole stack up — PostgreSQL, the schema, the API and the Stratum proxy:
+
+```powershell
+./scripts/dev.ps1            # up: postgres + migrations + API + proxy
+./scripts/dev.ps1 status     # what is running
+./scripts/dev.ps1 logs -Component api -Follow
+./scripts/dev.ps1 down       # stop everything (add -Purge to drop the database volume)
+```
+
+Values come from `.env`, which is created from `.env.example` on first run. The API and proxy run
+natively so their logs and process ids stay visible; pass `-Containers` to run the proxy and nginx
+from docker compose instead.
+
+By hand, that is:
+
 ```bash
 docker compose up -d postgres          # PostgreSQL on 5433
+dotnet ef database update --project backend/src/TokenMiner.Infrastructure --startup-project backend/src/TokenMiner.Api
 dotnet run --project backend/src/TokenMiner.Api
 ```
 

@@ -46,6 +46,9 @@ appsettings.*.Local.json
 playwright/.cache/
 ms-playwright/
 
+# Local dev state written by scripts/dev.ps1
+.dev/
+
 # OS
 .DS_Store
 Thumbs.db
