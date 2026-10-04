@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+/* Class-based dark mode (toggled on <html class="dark">). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* Able Pro "preset-1" blue. */
+  --color-brand-50: #edf3ff;
+  --color-brand-100: #d9e6ff;
+  --color-brand-200: #bcd3ff;
+  --color-brand-300: #93b6ff;
+  --color-brand-400: #6a93ff;
+  --color-brand-500: #4680ff;
+  --color-brand-600: #2f6be8;
+  --color-brand-700: #2555c4;
+  --color-brand-800: #22479e;
+  --color-brand-900: #213e7d;
+  --color-brand-950: #16234a;
+
+  --color-success: #2ca87f;
+  --color-warning: #e58a00;
+  --color-danger: #dc2626;
+  --color-info: #3ec9d6;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-[#f4f6fa] text-[13px] text-slate-600 antialiased dark:bg-slate-950 dark:text-slate-300;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    @apply text-slate-800 dark:text-slate-100;
+  }
+}
+
+@layer utilities {
+  .scrollbar-slim {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(148 163 184 / 0.5) transparent;
+  }
+
+  .scrollbar-slim::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .scrollbar-slim::-webkit-scrollbar-thumb {
+    background-color: rgb(148 163 184 / 0.5);
+    border-radius: 9999px;
+  }
+
+  /* Able Pro's card: subtle 1px border + soft shadow, ~8px radius. */
+  .pc-card {
+    @apply rounded-lg border border-slate-200/80 bg-white shadow-[0_1px_3px_rgba(15,23,42,0.06)] dark:border-slate-800 dark:bg-slate-900;
+  }
+}

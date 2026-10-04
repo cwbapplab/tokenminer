@@ -1,0 +1,5 @@
+[toolchain]
+# Both embedded miners need a recent toolchain: Quantus pins 1.93.0 and Pearl's
+# `zk-pow` is edition 2024 (>= 1.85). `stable` currently resolves to 1.93.x.
+channel = "stable"
+components = ["clippy", "rustfmt"]

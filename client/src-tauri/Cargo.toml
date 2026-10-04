@@ -1,0 +1,96 @@
+[package]
+name = "tokenminer-desktop"
+version = "0.1.0"
+description = "TokenMiner desktop client"
+authors = ["TokenMiner"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "tokenminer_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-http = "2"
+tauri-plugin-log = "2"
+tauri-plugin-process = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-store = "2"
+tauri-plugin-deep-link = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+thiserror = "2"
+chrono = "0.4"
+base64 = "0.22"
+bincode = "1.3"
+hex = "0.4"
+flate2 = "1"
+rand = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# --- Quantus miner (native, in-process; path deps into the submodule) ---
+# `engine-cpu`/`engine-gpu`/`engine-cuda` come in transitively via `miner-service`.
+miner-service = { path = "../miners/quantus-miner/crates/miner-service", optional = true }
+quic-transport = { path = "../miners/quantus-miner/crates/quic-transport", optional = true }
+# `metrics` here is the miner's crate; alias it so it does not collide with the crates.io `metrics`.
+miner-metrics = { package = "metrics", path = "../miners/quantus-miner/crates/metrics", features = ["http-exporter"], optional = true }
+
+# --- Pearl miner (native, in-process; the Rust crates behind py-pearl-mining) ---
+zk-pow = { path = "../miners/pearl/zk-pow", default-features = false, optional = true }
+pearl-blake3 = { path = "../miners/pearl/pearl-blake3", features = ["serde"], optional = true }
+# `zk-pow`'s public API speaks `primitive_types::U256`, so we have to match its 0.12 line for the
+# types to unify. Quantus pulls 0.13 separately; the two never meet.
+primitive-types = { version = "0.12", optional = true }
+
+# Stratum protocol framing/parsing, shared with the proxy so the wire format can't drift.
+sp-protocol = { path = "../../stratum-proxy/protocol" }
+
+# --- GPU mining: embedded cubins loaded through the CUDA driver API ---
+# `driver` + `dynamic-loading` is enough to load a prebuilt cubin, so nothing here needs the CUDA
+# toolkit at run time beyond the display driver. `nvrtc` is on only because cudarc gates
+# `CudaContext::load_module` behind it; we never call into NVRTC itself (it loads lazily).
+#
+# The CUDA version MUST match what Quantus's `engine-cuda` asks for (`cuda-12040`). cudarc's
+# `cuda-*` features are mutually exclusive and Cargo unifies features across a shared dependency,
+# so naming a different version enables both at once and cudarc's bindings get defined twice
+# (hundreds of E0428 errors). This only affects cudarc's own bindings; the cubins are produced by
+# whatever nvcc is installed, independently of this.
+cudarc = { version = "0.19", default-features = false, features = [
+    "cuda-12040",
+    "driver",
+    "dynamic-loading",
+    "fallback-dynamic-loading",
+    "nvrtc",
+    "std",
+] }
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+
+[features]
+default = ["quantus", "pearl"]
+quantus = ["dep:miner-service", "dep:quic-transport", "dep:miner-metrics"]
+pearl = ["dep:zk-pow", "dep:pearl-blake3", "dep:primitive-types"]
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+# NOTE: `panic` is intentionally left at the default ("unwind") — Quantus's CudaEngine
+# relies on `catch_unwind`, which does nothing under `panic = "abort"`.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true

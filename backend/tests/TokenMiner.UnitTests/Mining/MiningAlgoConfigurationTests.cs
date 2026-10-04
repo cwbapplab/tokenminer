@@ -1,3 +1,4 @@
+using System.Text.Json;
 using FluentAssertions;
 using TokenMiner.Application.Mining.Services;
 using Xunit;
@@ -21,6 +22,25 @@ public sealed class MiningAlgoConfigurationTests
 
         configuration.Command.Should().Be("rgminer.exe --algo {algo} --wallet {wallet}");
         configuration.SupportedCoins.Should().BeEquivalentTo(["qtc", "prl"]);
+    }
+
+    [Fact]
+    public void TryParse_AcceptsAStructuredConfigurationWithoutACommand()
+    {
+        const string json = """
+            {
+              "algo": "{algo}",
+              "endpoint": "{endpoint}",
+              "wallet": "{pool.payoutAddress}",
+              "workerId": "{workerId}",
+              "coin": "prl"
+            }
+            """;
+
+        MiningAlgoConfiguration.TryParse(json, out var configuration).Should().BeTrue();
+
+        configuration.Command.Should().BeEmpty();
+        configuration.Template.Should().NotBeNull();
     }
 
     [Fact]
@@ -80,5 +100,25 @@ public sealed class MiningAlgoConfigurationTests
         });
 
         rendered.Should().Be("miner value {unknown}");
+    }
+
+    [Fact]
+    public void RenderConfig_SubstitutesPlaceholdersInStringValuesOnly()
+    {
+        using var document = JsonDocument.Parse("""
+            { "algo": "{algo}", "endpoint": "{endpoint}", "workerId": "{workerId}", "count": 3 }
+            """);
+
+        var rendered = MiningCommandRenderer.RenderConfig(document.RootElement, new Dictionary<string, string>
+        {
+            ["algo"] = "rgminer-prl",
+            ["endpoint"] = "localhost:3333",
+            ["workerId"] = "abc",
+        });
+
+        rendered.GetProperty("algo").GetString().Should().Be("rgminer-prl");
+        rendered.GetProperty("endpoint").GetString().Should().Be("localhost:3333");
+        rendered.GetProperty("workerId").GetString().Should().Be("abc");
+        rendered.GetProperty("count").GetInt32().Should().Be(3);
     }
 }

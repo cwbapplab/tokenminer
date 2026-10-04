@@ -21,6 +21,7 @@ internal static class MiningTestData
         var coin = (await coinResponse.Content.ReadFromJsonAsync<CoinResponse>())!;
 
         // Only this algorithm advertises the coin, so selection is unambiguous.
+        // The configuration is the structured shape clients read directly.
         var algorithmResponse = await admin.PostAsJsonAsync("/api/admin/mining-algos", new
         {
             code = $"algo-{Suffix()}",
@@ -28,7 +29,11 @@ internal static class MiningTestData
             priority = 900,
             configuration = new
             {
-                command = "rgminer.exe --algo {algo} --stratum {poolHost} --wallet {wallet} --worker-name {workerId}",
+                algo = "{algo}",
+                endpoint = "{endpoint}",
+                wallet = "{wallet}",
+                workerId = "{workerId}",
+                coin = "{coin}",
                 supportedCoins = new[] { coin.Code },
             },
         });

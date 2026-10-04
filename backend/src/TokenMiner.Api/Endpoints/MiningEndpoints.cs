@@ -2,6 +2,7 @@ using System.Net.WebSockets;
 using System.Security.Claims;
 using System.Text.Json;
 using MediatR;
+using TokenMiner.Application.Mining.Models;
 using TokenMiner.Application.Mining.Sessions;
 using TokenMiner.Contracts.Mining;
 
@@ -32,6 +33,13 @@ public static class MiningEndpoints
             .Produces(StatusCodes.Status204NoContent)
             .ProducesProblem(StatusCodes.Status400BadRequest);
 
+        // Lets a client that restarted adopt the session the API still holds for its device.
+        group.MapGet("/session", GetSessionAsync)
+            .WithName("GetMiningSession")
+            .Produces<MiningSessionResponse>()
+            .Produces(StatusCodes.Status204NoContent)
+            .ProducesProblem(StatusCodes.Status401Unauthorized);
+
         // Liveness socket. A browser-based client (including a Tauri webview) cannot set an
         // Authorization header on a WebSocket, so the token may also arrive as ?access_token=.
         app.MapGet("/ws/mining", HandleSocketAsync)
@@ -58,19 +66,49 @@ public static class MiningEndpoints
             new StartMiningCommand(userId.Value, request.HardwareId, request.PoolId),
             cancellationToken);
 
-        return Results.Ok(new MiningSessionResponse(
-            session.SessionId,
-            session.PoolId,
-            session.PoolName,
-            session.CoinId,
-            session.CoinCode,
-            session.AlgorithmId,
-            session.AlgorithmCode,
-            session.WorkerId,
-            session.MinerCommand,
-            session.Status,
-            session.StartedAt));
+        return Results.Ok(ToResponse(session));
     }
+
+    private static async Task<IResult> GetSessionAsync(
+        Guid? hardwareId,
+        ClaimsPrincipal user,
+        ISender sender,
+        CancellationToken cancellationToken)
+    {
+        var userId = user.GetUserId();
+        if (userId is null)
+        {
+            return Results.Unauthorized();
+        }
+
+        if (hardwareId is null || hardwareId == Guid.Empty)
+        {
+            return Results.BadRequest();
+        }
+
+        var session = await sender.Send(
+            new GetMiningSessionQuery(userId.Value, hardwareId.Value),
+            cancellationToken);
+
+        return session is null
+            ? Results.NoContent()
+            : Results.Ok(ToResponse(session));
+    }
+
+    private static MiningSessionResponse ToResponse(MiningSessionDto session) => new(
+        session.SessionId,
+        session.PoolId,
+        session.PoolName,
+        session.CoinId,
+        session.CoinCode,
+        session.AlgorithmId,
+        session.AlgorithmCode,
+        session.WorkerId,
+        session.MinerCommand,
+        session.MinerConfig,
+        session.StratumEndpoint,
+        session.Status,
+        session.StartedAt);
 
     private static async Task<IResult> StopAsync(
         StopMiningRequest request,

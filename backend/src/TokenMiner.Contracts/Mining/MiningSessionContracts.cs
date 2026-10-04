@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace TokenMiner.Contracts.Mining;
 
 /// <summary>
@@ -16,6 +18,16 @@ public sealed record MiningSessionResponse(
     string AlgorithmCode,
     string WorkerId,
     string MinerCommand,
+    /// <summary>
+    /// The algorithm configuration with the session's placeholders rendered — the structured
+    /// form clients read directly (algo, endpoint, wallet, workerId, coin).
+    /// </summary>
+    JsonElement MinerConfig,
+    /// <summary>
+    /// The public Stratum endpoint (host:port) the client must connect to — always the
+    /// TokenMiner proxy, never the pool. Clients must not connect to a pool directly.
+    /// </summary>
+    string StratumEndpoint,
     string Status,
     DateTimeOffset StartedAt);
 

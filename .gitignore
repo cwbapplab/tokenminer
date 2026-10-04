@@ -27,6 +27,9 @@ Migrations/**/*.Designer.cs.bak
 
 # Rust
 /stratum-proxy/target/
+/client/src-tauri/target/
+/client/miners/*/target/
+/client/miners/*/crates/*/target/
 
 # Node (client)
 node_modules/

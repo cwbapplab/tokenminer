@@ -73,6 +73,8 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
             // Push the periodic jobs far into the future so tests drive each step explicitly.
             ["Mining__WatchdogIntervalSeconds"] = "3600",
             ["Mining__HeartbeatGraceSeconds"] = "10",
+            // The public proxy endpoint clients must connect to; sessions refuse to start without it.
+            ["Mining__PublicStratumEndpoint"] = "localhost:3333",
             ["Mining__ShareProcessorIntervalSeconds"] = "3600",
             ["Mining__StatisticsIntervalSeconds"] = "3600",
             ["Mining__ServiceSharedSecret"] = MiningTestData.ServiceSharedSecret,

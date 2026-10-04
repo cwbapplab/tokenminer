@@ -15,11 +15,16 @@
     Stratum pool from mock-pool/ (Pearl on 3335, Quantus on 3336), and -Portal to also start the
     management-portal Vite dev server on 5273.
 
+    Pass -Debug to raise every component's log level: the proxy runs with RUST_LOG=debug (which
+    is where the verbatim Stratum relay is logged, both directions), the API with Serilog at
+    Debug, and the mock pool at debug.
+
 .EXAMPLE
     ./scripts/dev.ps1
     ./scripts/dev.ps1 up
     ./scripts/dev.ps1 status
     ./scripts/dev.ps1 logs -Component api -Follow
+    ./scripts/dev.ps1 restart -Service api
     ./scripts/dev.ps1 down
     ./scripts/dev.ps1 help
 
@@ -32,12 +37,16 @@
     ./scripts/dev.ps1 up -MockPool -Portal
 
 .EXAMPLE
+    # The whole stack with debug logging (proxy relay, API, mock pool).
+    ./scripts/dev.ps1 up -MockPool -Portal -Debug
+
+.EXAMPLE
     # Tear everything down and delete the database volume.
     ./scripts/dev.ps1 down -Purge
 #>
-[CmdletBinding()]
 param(
-    [Parameter(Position = 0)]
+    # The first positional argument. Deliberately no [Parameter()] attribute: that alone makes the
+    # script an advanced function, which reserves -Debug and rejects the switch below.
     [ValidateSet('up', 'down', 'restart', 'status', 'logs', 'migrate', 'help')]
     [string]$Command = 'up',
 
@@ -53,12 +62,26 @@ param(
     # With 'down': also delete the PostgreSQL volume, destroying all local data.
     [switch]$Purge,
 
+    # With 'restart': restart a single service instead of the whole stack.
+    [ValidateSet('all', 'postgres', 'api', 'proxy', 'mock-pool', 'portal')]
+    [string]$Service = 'all',
+
     # Which component 'logs' should read.
     [ValidateSet('api', 'proxy', 'mock-pool', 'portal', 'all')]
     [string]$Component = 'all',
 
     # With 'logs': keep reading as new lines arrive.
     [switch]$Follow,
+
+    <#
+        Raise every component's log level to debug: proxy RUST_LOG=debug, API Serilog Debug, mock
+        pool debug. Declared here rather than relying on the common -Debug parameter so the level
+        can be applied to the child processes.
+
+        Note: this is why the script has no [CmdletBinding()] - it would reserve -Debug and reject
+        this parameter. Unknown arguments are rejected explicitly below instead.
+    #>
+    [switch]$Debug,
 
     # With 'logs': how many existing lines to show.
     [int]$Tail = 50,
@@ -240,7 +263,8 @@ function Start-NativeProxy {
     $env:TOKENMINER_API_BASE_URL = "http://localhost:$ApiPort"
     $env:TOKENMINER_SERVICE_ID = 'stratum-proxy'
     $env:STRATUM_LISTEN_ADDR = "0.0.0.0:$ProxyPort"
-    $env:RUST_LOG = 'info'
+    # Debug is where the verbatim relay is logged, both directions.
+    $env:RUST_LOG = if ($Debug) { 'debug' } else { 'info' }
 
     Write-Step "Building the stratum proxy"
 
@@ -597,6 +621,14 @@ function Start-Api {
         "http://localhost:$ApiPort"
     }
 
+    # Serilog reads its level from configuration, so env beats appsettings.json.
+    if ($Debug) {
+        $env:Serilog__MinimumLevel__Default = 'Debug'
+    }
+    else {
+        Remove-Item Env:\Serilog__MinimumLevel__Default -ErrorAction SilentlyContinue
+    }
+
     Write-Step "Starting the API"
 
     Start-TrackedProcess -Name 'api' -FilePath (Get-Command dotnet).Source -ArgumentList @($ApiDll) | Out-Null
@@ -663,7 +695,7 @@ function Start-MockPool {
     # The mock pool listens on a port per coin; point a registered pool's stratumEndpoint here.
     $env:MOCK_POOL_PRL_ADDR = "0.0.0.0:$MockPoolPearlPort"
     $env:MOCK_POOL_QTC_ADDR = "0.0.0.0:$MockPoolQuantusPort"
-    $env:MOCK_POOL_LOG_LEVEL = 'info'
+    $env:MOCK_POOL_LOG_LEVEL = if ($Debug) { 'debug' } else { 'info' }
 
     Write-Step "Starting the mock pool"
 
@@ -783,6 +815,72 @@ function Invoke-Up {
     Write-Host ''
     Write-Detail "logs:  ./scripts/dev.ps1 logs -Component api -Follow"
     Write-Detail "stop:  ./scripts/dev.ps1 down"
+    Write-Host ''
+}
+
+<#
+    Stops a single component so 'restart -Service <name>' can bring just that piece back.
+    Mirrors what Invoke-Down does, narrowed to one name.
+#>
+function Stop-Component {
+    param([string]$Name)
+
+    switch ($Name) {
+        'postgres' {
+            if (Test-ContainerRunning -Name 'tokenminer-postgres') {
+                Invoke-Compose -Arguments @('stop', 'postgres')
+                Write-Ok "stopped postgres"
+            }
+        }
+        'api' {
+            Stop-TrackedProcess -Name 'api' | Out-Null
+            Clear-Port -Port $ApiPort -Label 'api'
+        }
+        'proxy' {
+            if (Test-ContainerRunning -Name 'tokenminer-stratum-proxy') {
+                Invoke-Compose -Arguments @('--profile', 'full', 'rm', '-s', '-f', 'stratum-proxy', 'nginx')
+                Write-Ok "stopped stratum-proxy and nginx"
+            }
+            else {
+                Stop-TrackedProcess -Name 'proxy' | Out-Null
+                Clear-Port -Port $ProxyPort -Label 'stratum'
+            }
+        }
+        'mock-pool' {
+            Stop-TrackedProcess -Name 'mock-pool' | Out-Null
+            Clear-Port -Port $MockPoolPearlPort -Label 'mock-pool (prl)'
+            Clear-Port -Port $MockPoolQuantusPort -Label 'mock-pool (qtc)'
+        }
+        'portal' {
+            Stop-TrackedProcess -Name 'portal' | Out-Null
+            Clear-Port -Port $PortalPort -Label 'portal'
+        }
+    }
+}
+
+function Invoke-Restart {
+    if ($Service -eq 'all') {
+        Invoke-Down
+        Invoke-Up
+        return
+    }
+
+    $script:Settings = Initialize-Environment
+
+    Write-Step "Restarting $Service"
+
+    Stop-Component -Name $Service
+
+    switch ($Service) {
+        'postgres' { Start-Postgres }
+        'api' { Start-Api }
+        'proxy' { Start-Proxy }
+        'mock-pool' { Start-MockPool }
+        'portal' { Start-Portal }
+    }
+
+    Write-Host ''
+    Write-Host "  Restarted $Service." -ForegroundColor Green
     Write-Host ''
 }
 
@@ -952,7 +1050,7 @@ function Invoke-Help {
     Write-Host '  Commands:' -ForegroundColor Cyan
     Write-Detail 'up        Bring the stack up (default)'
     Write-Detail 'down      Stop the stack'
-    Write-Detail 'restart   Stop, then bring the stack up again'
+    Write-Detail 'restart   Stop, then bring the stack up again (or one service with -Service)'
     Write-Detail 'status    Show what is running'
     Write-Detail 'logs      Print (and optionally follow) component logs'
     Write-Detail 'migrate   Apply database migrations'
@@ -963,13 +1061,17 @@ function Invoke-Help {
     Write-Detail '-MockPool            Also start the mock Stratum pool (Pearl 3335, Quantus 3336)'
     Write-Detail '-Portal              Also start the management portal (port 5273)'
     Write-Detail '-Purge               With down: also delete the PostgreSQL volume'
+    Write-Detail '-Service <name>      With restart: postgres, api, proxy, mock-pool or portal (default all)'
     Write-Detail '-Component <name>    With logs: api, proxy, mock-pool, portal or all'
     Write-Detail '-Follow              With logs: keep reading as new lines arrive (one component)'
+    Write-Detail '-Debug               Raise every component log level to debug'
     Write-Detail '-Tail <n>            With logs: how many existing lines to show (default 50)'
     Write-Detail '-TimeoutSeconds <n>  How long to wait for a component to start (default 120)'
     Write-Host ''
     Write-Host '  Examples:' -ForegroundColor Cyan
     Write-Detail './scripts/dev.ps1 up -MockPool -Portal'
+    Write-Detail './scripts/dev.ps1 up -Debug'
+    Write-Detail './scripts/dev.ps1 restart -Service api'
     Write-Detail './scripts/dev.ps1 logs -Component api -Follow'
     Write-Detail './scripts/dev.ps1 down -Purge'
     Write-Host ''
@@ -977,13 +1079,22 @@ function Invoke-Help {
 
 # --- Entry point ------------------------------------------------------------------------------
 
+# The script is deliberately not an advanced function (see -Debug), so PowerShell would otherwise
+# treat an unknown argument as positional and silently ignore it.
+if ($args.Count -gt 0) {
+    Write-Host ''
+    Write-Fail "Unknown argument(s): $($args -join ' '). Run './scripts/dev.ps1 help' for usage."
+    Write-Host ''
+    exit 1
+}
+
 Push-Location $RepoRoot
 
 try {
     switch ($Command) {
         'up' { Invoke-Up }
         'down' { Invoke-Down }
-        'restart' { Invoke-Down; Invoke-Up }
+        'restart' { Invoke-Restart }
         'status' { Invoke-Status }
         'logs' { Invoke-Logs }
         'migrate' { $script:Settings = Initialize-Environment; Start-Postgres; Invoke-Migrate }

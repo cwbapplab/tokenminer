@@ -77,7 +77,7 @@ internal sealed class StartMiningCommandHandler(
         }
 
         var (pool, poolDetails, coin) = await SelectPoolAsync(request.PoolId, cancellationToken);
-        var (algorithm, configuration) = await SelectAlgorithmAsync(coin, cancellationToken);
+        var (algorithm, _) = await SelectAlgorithmAsync(coin, cancellationToken);
 
         // The worker identity is always derived server-side; a client can never choose it. The
         // hardware id in "N" form is 32 chars, which is the pool's cap for a worker name.
@@ -94,28 +94,16 @@ internal sealed class StartMiningCommandHandler(
 
         sessions.Add(session);
 
-        var upstreamStratumHost = string.IsNullOrWhiteSpace(poolDetails.StratumEndpoint)
-            ? StripScheme(poolDetails.BaseUrl)
-            : poolDetails.StratumEndpoint;
-
-        // Without a configured proxy endpoint the command points straight at the pool.
-        var publicStratumHost = string.IsNullOrWhiteSpace(miningOptions.PublicStratumEndpoint)
-            ? upstreamStratumHost
-            : miningOptions.PublicStratumEndpoint;
-
-        var minerCommand = MiningCommandRenderer.Render(configuration.Command, new Dictionary<string, string>
-        {
-            ["coin"] = coin.Code,
-            ["coinName"] = coin.Name,
-            ["algo"] = algorithm.Code,
-            ["poolUrl"] = poolDetails.BaseUrl,
-            ["poolHost"] = StripScheme(poolDetails.BaseUrl),
-            ["stratumHost"] = publicStratumHost,
-            ["upstreamStratumHost"] = upstreamStratumHost,
-            ["wallet"] = poolDetails.PayoutAddress ?? string.Empty,
-            ["workerId"] = workerIdentifier,
-            ["hardwareId"] = device.HardwareId.ToString(),
-        });
+        // Built before persisting: an unconfigured proxy endpoint refuses the start rather than
+        // leaving a half-created session behind.
+        var sessionDto = MiningSessionProjection.Build(
+            session,
+            device,
+            pool,
+            poolDetails,
+            coin,
+            algorithm,
+            miningOptions);
 
         logs.Add(new MiningLog(
             Guid.NewGuid(),
@@ -137,18 +125,7 @@ internal sealed class StartMiningCommandHandler(
 
         await unitOfWork.SaveChangesAsync(cancellationToken);
 
-        return new MiningSessionDto(
-            session.Id,
-            pool.Id,
-            pool.Name,
-            coin.Id,
-            coin.Code,
-            algorithm.Id,
-            algorithm.Code,
-            workerIdentifier,
-            minerCommand,
-            session.Status.ToDbValue(),
-            session.StartedAt);
+        return sessionDto;
     }
 
     private async Task<(Pool Pool, PoolDetails Details, Coin Coin)> SelectPoolAsync(
@@ -223,11 +200,5 @@ internal sealed class StartMiningCommandHandler(
         }
 
         throw new ConflictException($"No active mining algorithm is configured for coin '{coin.Code}'.");
-    }
-
-    private static string StripScheme(string url)
-    {
-        var separator = url.IndexOf("://", StringComparison.Ordinal);
-        return separator >= 0 ? url[(separator + 3)..] : url;
     }
 }

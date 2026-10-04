@@ -1,3 +1,4 @@
+using System.Text.Json;
 using TokenMiner.Domain.Mining;
 using TokenMiner.Domain.Mining.Enums;
 
@@ -55,6 +56,9 @@ public sealed record MiningSessionDto(
     string AlgorithmCode,
     string WorkerId,
     string MinerCommand,
+    /// <summary>The rendered algorithm configuration (algo/endpoint/wallet/workerId/coin).</summary>
+    JsonElement MinerConfig,
+    string StratumEndpoint,
     string Status,
     DateTimeOffset StartedAt);
 
