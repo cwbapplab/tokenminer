@@ -326,54 +326,49 @@ extern "C" __global__ void tokenminer_fill_i8(
 // for `16 * 16 * k` multiply-accumulates. A rectangle amortises each side across the other axis --
 // `16 * k * (1/cols + 1/rows)` bytes per tile.
 //
-// **This kernel is still bandwidth-bound, just less badly.** An earlier version of this comment said
-// otherwise — "not memory-bound", "bound by instruction issue" — and the arithmetic now contradicts
-// it. At the shipped geometry a block reads `ROWS*16*k` bytes of A and `COLS*16*k` of B and there are
-// `(tiles/ROWS) * (tiles/COLS)` blocks per grid, so a full 8192x8192-tile grid moves **597 GB** from
-// DRAM to read 1 GB of operands. Over the 539 ms the shipped 16x8 took to fold it, that is 1.53 TB/s
-// against an RTX 5080's ~1.79 TB/s peak — about 85% of achievable bandwidth. That is the ceiling
-// this kernel is actually pressing against, and it is why occupancy changes lose (see the geometry
-// note below) and why widening columns is the lever that works.
+// **This kernel is latency-bound at low occupancy, not bandwidth-bound.** That took two corrections
+// to establish, and an earlier version of this comment asserted the opposite — twice, confidently,
+// and wrong both times. The arithmetic below is recorded because it is what made it look true.
+//
+// The arithmetic: a block reads `ROWS*16*k` bytes of A and `COLS*16*k` of B, and there are
+// `(tiles/ROWS) * (tiles/COLS)` blocks per grid, so a full 8192x8192-tile grid moves ~597 GB from
+// DRAM to read 1 GB of operands. Over the 539 ms the 16x8 fold took, that is 1.53 TB/s against the
+// 5080's ~1.79 TB/s peak — about 85%, which reads like a bandwidth wall.
+//
+// The measurement that refutes it: shrinking the tile grid so the operands fit inside the 64 MB L2
+// does *not* speed the kernel up. Throughput *falls*, because there are then too few blocks to fill
+// 84 SMs:
+// ```text
+//   16384 tiles/row  138.2 TH/s     operand A = 1.0 GiB
+//    8192 tiles/row  138.8 TH/s     operand A = 512 MiB
+//    4096 tiles/row  134.9 TH/s     operand A = 256 MiB  (fits L2)
+//    2048 tiles/row  126.6 TH/s     operand A = 128 MiB
+//    1024 tiles/row  116.9 TH/s
+//     512 tiles/row   97.3 TH/s
+// ```
+// If DRAM were the constraint the smaller grids would be faster — they are strictly less traffic,
+// and from 4096 down they fit in L2 entirely. They are slower.
+//
+// The profiler settles it, and says something neither the arithmetic nor the grid sweep could:
+// DRAM throughput is **56.2%** and the Tensor(INT) pipe is **57.6%**, with Nsight naming both
+// "not a bottleneck", while **68.8% of cycles have no eligible warp** because occupancy is 33% and
+// register-capped. The wall is latency at 4 warps per scheduler. That is why every traffic-shaped
+// idea tried measured as no effect or worse (L2 swizzle, `cp.async.ca`), and why the one lever that
+// did work — widening columns — helped only 5%.
 //
 // Ablations that price the rest of the loop, all on the real kernel at production geometry:
-//   - the per-tile BLAKE3 and bound compare cost **0.6%** (compile with `-DPOW_SKIP_HASH`). The
-//     fold is the entire cost; the hash is free alongside it.
+//   - the per-tile BLAKE3 and bound compare cost **0.6%** (compile with `-DPOW_SKIP_HASH`).
+//   - the same `mma` count with the `ldmatrix` operand loads removed runs at **228 TH/s**. Over half
+//     the instructions issued per `mma` are fragment loads, and an issue/latency-bound kernel feels
+//     that more than a bandwidth-bound one would.
 //   - `cp.async.ca` (cache in L1) is **worse** than `.cg`: 122.4 against 130.7 at 16x8, and 113.4
-//     against 137.0 at 16x12. The staged bytes are read once per block and L1 space is better spent
-//     on nothing, so `.cg` stays the default. (This also corrects the older claim below that the
-//     staged bytes are "never reused by another block" — they *are* reused, by the ~683 other
-//     column strips reading the same A rows, and caching them in L1 still loses because the reuse is
-//     too far apart in time to hit L1's lifetime.)
-//   - an L2-locality swizzle of the block index (`POW_L2_GROUP`) changes nothing measurable: 130.1
-//     at group 1 against 130.6 at 2 and 130.5 at 32. With 84 SMs and one block each, the concurrently
-//     resident blocks already span the whole grid, so there is no grouping that improves locality.
-//
-// The remaining lever that arithmetic says *should* work is a squarer rectangle, since traffic scales
-// as `1/ROWS + 1/COLS` — but `POW_BLOCK_ROWS` is tied to the thread count (`POW_THREADS = ROWS*32`),
-// and going to 16x16 spills registers hard (see `POW_MIN_BLOCKS`) for a measured 62 TH/s.
-//
-// **The register file caps the rectangle at area 256, and that is the ceiling on this algorithm.**
-// The accumulator is `COLS * 2 * 4` registers per lane and a block has `ROWS * 32` lanes, so a
-// block's accumulator costs `ROWS * COLS * 256` registers — independent of how the work is split
-// across warps. sm_120 has 65,536 registers per SM, so `ROWS * COLS <= 256` however the block is
-// organised, and `32 x 8` would need 65,536 registers for the accumulator alone. The minimum
-// possible operand traffic is therefore `16 * k * (1/R + 1/C)`, minimised at `R = C = 16`. Every
-// rectangle measured, at production geometry:
-// ```text
-//   16x12  137.9 TH/s   area 192    <- shipped
-//   24x8   111.2 TH/s   area 192
-//   12x16   98.4 TH/s   area 192
-//    8x24   76.6 TH/s   area 192
-//   16x16   62.4 TH/s   area 256    (spills 592 B: 16 columns is 128 acc registers per lane)
-// ```
-// Note that area alone does not predict throughput — 16x12 beats 12x16 at identical area, because
-// widening *columns* amortises the larger operand and the `ldmatrix` B-fragment layout needs a
-// multiple of 8 columns. But the ceiling is near: the theoretical best at area 256 is roughly
-// 2x the shipped rectangle's traffic improvement, and it cannot be built without spilling.
-//
-// So ~138 TH/s is what this fold does on this hardware, and it is a bandwidth wall rather than a
-// tuning failure. Reaching materially past it needs a different arithmetic decomposition — one that
-// keeps the whole k-deep accumulator out of registers — not a better schedule of this one.
+//     against 137.0 at 16x12.
+//   - an L2-locality swizzle of the block index (`POW_L2_GROUP`) changes nothing: 130.1 at group 1
+//     against 130.6 at 2 and 130.5 at 32.
+//   - stage depth: s2 = 138.8 beats s1 = 131.1; s3 does not fit at 16x12 (118,272 B against a
+//     101,376 B limit) and is slower at geometries where it does.
+//   - staged width: `POW_BK` 64 = 138.8, 32 = 72.0, 128 does not fit. The 32 -> 64 step is the
+//     historical +77%, and it holds.
 //
 // `POW_SMEM_STRIDE` pads every staged row, so a block spends more shared memory than the data needs.
 // That is not an occupancy lever at one block per SM — both the register file and shared memory are
@@ -399,16 +394,43 @@ extern "C" __global__ void tokenminer_fill_i8(
 //   16x4    97.1 TH/s   2 blocks/SM
 // ```
 //
-// Doubled occupancy loses to halved operand reuse, by a wide margin. Traffic is the constraint here,
-// not latency hiding. Do not re-derive this as an occupancy story.
+// Doubled occupancy loses, by a wide margin. The reason is registers, not traffic — see the profile
+// below — but either way the small rectangles that *can* reach two blocks/SM all measure slower.
 //
-// The traffic arithmetic behind it: each block reads `ROWS*16*k` bytes of A and `COLS*16*k` of B, and
-// there are `(tiles/ROWS) * (tiles/COLS)` blocks per grid, so traffic per grid is
-// `(tiles/ROWS)*(tiles/COLS) * (ROWS+COLS)*16*k` — i.e. it scales as `1/ROWS + 1/COLS`. Minimised by
-// a square rectangle, which is why the column sweep below rises to 12 and then falls.
+// **What the profiler says** (Nsight Compute `--set full`, sm_120a, 16x12, production geometry).
+// These are the numbers that decide whether this stops here:
+// ```text
+//   Registers Per Thread        128        exactly the __launch_bounds__(THREADS, 1) ceiling
+//   Block Limit Registers         1        -> a second block per SM will not fit
+//   Block Limit Shared Mem        1        (shared memory agrees; both are binding)
+//   Theoretical Occupancy     33.3%        16 warps/SM of a possible 48
+//   Eligible Warps/Scheduler   0.55        of 4.00 active; "No Eligible" on 68.8% of cycles
+//   Warp Cycles Per Issued Inst 12.80      of which 4.7 is math-pipe throttle (36.6%)
+//   Local Memory (spill)       7.04 MB     100% overhead
+//   Compute (SM) Throughput    57.6%       Tensor (INT) pipe — explicitly "not a bottleneck"
+//   DRAM Throughput            56.2%       532 GB/s
+// ```
+// Tensor at 58% and not the bottleneck, DRAM at 56% and not the bottleneck, and 69% of cycles with
+// no eligible warp at 4 warps/scheduler: the kernel is **latency-bound at low occupancy**, and the
+// occupancy is register-bound. Tensor(INT) at 57.6% is the ceiling being pressed, not the wall.
 //
-// What *did* move it: widening columns from 8 to 12 cuts traffic 768 GB -> 597 GB per grid for
-// 5.4%, and `POW_SMEM_T_DYNAMIC` buys a further 0.5%. Neither is dramatic, and neither is 200 TH/s.
+// **Why 2 blocks/SM is not reachable from here.** It needs `regs * threads <= 32768`, i.e. 64
+// registers per lane. The accumulator alone is `POW_BLOCK_COLS * 2 * 4 = 8 * COLS` registers per
+// lane — 96 at 12 columns, 128 at 16 — so it does not fit in 64 alongside anything else. Forcing it
+// with `__launch_bounds__(POW_THREADS, 2)` compiles and then spills **924 bytes of stores and 1060
+// of loads** per thread, which is no trade at any occupancy. The rectangle has to shrink to fit, and
+// every rectangle that fits measures slower (above).
+//
+// **The two ways past ~138 TH/s**, both of which are rewrites rather than schedule changes:
+//   1. *A decomposition that does not hold the whole k-deep accumulator in registers.* Split the k
+//      loop across warps and land partial sums in shared memory, freeing the register file for
+//      occupancy. The profile says this is the binding constraint.
+//   2. *Fewer instructions per multiply.* The same `mma` count with no `ldmatrix` operand loads runs
+//      at **228 TH/s** against 138 here, so the fragment loads are eating the issue slots.
+//      `ldmatrix.x4` already replaces four `LDS.32` per operand; m16n8k32 offers no wider fragment.
+//
+// What *did* move it, for the record: widening columns 8 -> 12 is +5.4% and `POW_SMEM_T_DYNAMIC`
+// a further +0.5%. Neither is 200 TH/s, and neither was close.
 #ifndef POW_BLOCK_ROWS
 #define POW_BLOCK_ROWS 16
 #endif
@@ -432,6 +454,13 @@ extern "C" __global__ void tokenminer_fill_i8(
 // one number the launch requests instead of two the reader has to add.
 #ifndef POW_SMEM_T_DYNAMIC
 #define POW_SMEM_T_DYNAMIC 1
+#endif
+// 1 = hash the transcript in place out of `sT` instead of copying it into a local `message[64]`.
+// The words are already contiguous little-endian bytes, so the copy is redundant; it is also the
+// only local array in the kernel and the profile attributes all 7.04 MB of local-memory traffic to
+// spilling, which a 64-byte buffer live across a call is exactly the shape of. See the hash site.
+#ifndef POW_HASH_DIRECT
+#define POW_HASH_DIRECT 0
 #endif
 #define POW_WARPS POW_BLOCK_ROWS
 #define POW_THREADS (POW_WARPS * 32)
@@ -505,10 +534,20 @@ extern __shared__ __align__(16) signed char pow_dynamic_smem[];
 //
 // `rank` must be a whole number of stages or `steps_per_rank` is zero and the fold's modulo divides
 // by zero; the host checks that, and a stage width above `rank` is the easy way to hit it.
+//
+// Overridable so the stage width can be swept rather than assumed. The barrier count per unit of
+// multiply-accumulates scales as `1/POW_BK`, which is why going 32 -> 64 was worth +77% historically
+// and why 128 is worth measuring: at 128 the step loop issues four `mma` k-blocks between a
+// `cp.async` wait and a `BAR.SYNC` instead of two. It costs shared memory (the staging buffers scale
+// with `POW_BK`) and the host's `pow_smem_stride`/`pow_bk` have to mirror whatever is chosen here.
 #if POW_DP4A
+#ifndef POW_BK
 #define POW_BK 32
+#endif
 #else
+#ifndef POW_BK
 #define POW_BK 64
+#endif
 #endif
 
 // The shared row stride: `POW_BK + 16`, so every staged row is padded past its own width. An unpadded
@@ -1155,6 +1194,24 @@ const unsigned int prev = POW_ST_AT(warp, t, slot);
 #if defined(POW_SKIP_HASH)
         if (key_words[0] == 0xffffffffu) { words[0] = 1u; }
 #else
+        // The sixteen transcript words are already contiguous 64 bytes in `sT`, and BLAKE3 loads
+        // them little-endian, so `b3_chunk_cv` can read them in place. `POW_HASH_DIRECT` skips
+        // building `message[]` entirely -- which is not a micro-optimisation: the profile shows
+        // 7.04 MB of *local* memory traffic per launch at 100% overhead, i.e. register spilling,
+        // and an 80-byte stack frame with 16 bytes of spill stores. A 64-byte local buffer held
+        // live across the call is exactly the shape of thing that spills.
+#if POW_HASH_DIRECT
+        b3_chunk_cv(reinterpret_cast<const unsigned char*>(&POW_ST_AT(warp, tile_in_warp, 0)), 64u,
+                    0ull, key_words, B3_KEYED_HASH, B3_ROOT, words);
+#else
+        // Measured and kept: reading the transcript in place instead of copying it into a local
+        // `message[64]` is *correct and marginally cheaper* but does not move the kernel — 137.9
+        // against 138.8, inside run-to-run noise, and the register count stays at 128 either way.
+        // The spill is not this buffer. It is the accumulator running into the `__launch_bounds__`
+        // cap, which `-Xptxas -v` shows as an 80-byte stack frame and 16 bytes of spill stores
+        // whether or not the buffer is there. Left on because it removes a redundant copy, not
+        // because it is a speedup — the comment above says so, and the measurement that decided
+        // it is recorded here rather than the flag being quietly defaulted.
         unsigned char message[64];
         #pragma unroll
         for (int i = 0; i < POW_TRANSCRIPT_WORDS; ++i) {
@@ -1165,6 +1222,7 @@ const unsigned int prev = POW_ST_AT(warp, t, slot);
             message[i * 4 + 3] = (unsigned char)(word >> 24);
         }
         b3_chunk_cv(message, 64u, 0ull, key_words, B3_KEYED_HASH, B3_ROOT, words);
+#endif
 #endif
 
         // The verifier's rule is `U256::from_little_endian(hash_jackpot) <= bound`
