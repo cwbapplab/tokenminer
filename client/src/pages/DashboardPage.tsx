@@ -81,11 +81,11 @@ export function DashboardPage() {
 
   // Each engine's tab plots its own rate on its own axis, in its own unit.
 //
-// The overview plots both, which cannot be on one scale: a Pearl rate is tens of millions of tiles
-// per second and a Quantus rate is orders of magnitude smaller, so a shared axis draws Quantus as a
-// flat line on the floor — a chart that looks like a stopped engine. Normalising each against its
-// own peak over the window shows both engines' shape (running, stalling, restarting) without
-// implying that the two numbers are comparable, and the exact rates are on the cards above.
+// The overview plots both, which cannot be on one scale: a Pearl rate is tens of TH/s and a Quantus
+// rate is orders of magnitude smaller, so a shared axis draws Quantus as a flat line on the floor —
+// a chart that looks like a stopped engine. Normalising each against its own peak over the window
+// shows both engines' shape (running, stalling, restarting) without implying that the two numbers are
+// comparable, and the exact rates are on the cards above.
   const peak = (series: number[]) => series.reduce((max, v) => (v > max ? v : max), 0);
   const relative = (series: number[]) => {
     const top = peak(series);
@@ -230,7 +230,7 @@ export function DashboardPage() {
               <ul className="divide-y divide-slate-100 dark:divide-slate-800">
                 <StatRow icon={Cpu} label="CPU hashrate" value={formatHashrate(miners.quantus.cpuHashrate)} />
                 <StatRow icon={Zap} label="Quantus GPU hashrate" value={formatHashrate(miners.quantus.gpuHashrate)} />
-                <StatRow icon={Pickaxe} label="Pearl tile rate" value={formatPearlRate(miners.pearl.gpuHashrate)} />
+                <StatRow icon={Pickaxe} label="Pearl hashrate" value={formatPearlRate(miners.pearl.gpuHashrate)} />
                 <StatRow icon={Pickaxe} label="Workers" value={String(miners.quantus.workers + miners.pearl.workers)} />
                 <StatRow icon={Gauge} label="Active jobs" value={String(miners.quantus.activeJobs)} />
               </ul>

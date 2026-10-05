@@ -9,6 +9,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5273,
+    // Bound beyond loopback so the portal is reachable from other machines on the network.
+    host: '0.0.0.0',
     strictPort: false,
     proxy: {
       '/api': { target: apiTarget, changeOrigin: true },

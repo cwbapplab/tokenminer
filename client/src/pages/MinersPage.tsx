@@ -9,7 +9,7 @@ import { onMinerLog, startSessionMiner, stopMiner } from "../lib/miners";
 import { startSession, stopSession, getSession } from "../lib/session";
 import { startHeartbeat, stopHeartbeat } from "../lib/heartbeat";
 import { loadSettings } from "../lib/settings";
-import { formatHashrate } from "../lib/utils";
+import { formatHashrate, formatPearlRate } from "../lib/utils";
 import type { MinerCommandParams, MinerKind, MinerStatus, MiningSession } from "../lib/types";
 
 const ENGINE_CARDS: Array<{ kind: MinerKind; name: string; coin: string; blurb: string }> = [
@@ -235,6 +235,10 @@ export function MinersPage() {
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
         {ENGINE_CARDS.map((card) => {
           const status = miners[card.kind];
+          // Each engine's status carries its rate in its own unit — Quantus H/s, Pearl TH/s — so the
+          // formatter is chosen per card. `formatHashrate` on a Pearl rate would rescale 56 TH/s into
+          // "56.00 KH/s".
+          const formatRate = card.kind === "pearl" ? formatPearlRate : formatHashrate;
           return (
             <Card key={card.kind} className="flex flex-col">
               <CardHeader
@@ -249,7 +253,7 @@ export function MinersPage() {
               />
 
               <div className="grid grid-cols-3 gap-3 px-5 py-4">
-                <Metric label="Hashrate" value={formatHashrate(status.hashrate)} />
+                <Metric label="Hashrate" value={formatRate(status.hashrate)} />
                 <Metric label="Workers" value={String(status.workers)} />
                 <Metric label="Jobs" value={String(status.activeJobs)} />
               </div>

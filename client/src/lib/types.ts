@@ -111,8 +111,13 @@ export type MinerState = "stopped" | "starting" | "running" | "error";
 export interface MinerStatus {
   kind: MinerKind;
   state: MinerState;
-  /** Total hashes per second across the engine's workers. */
+  /**
+   * Rate across the engine's workers, in the unit that engine reports: H/s for Quantus, TH/s for
+   * Pearl. Not a common unit — a Pearl TH is 10^12 int8 MACs, not 10^12 Quantus hashes — so format
+   * with `formatPearlRate` or `formatHashrate` by `kind`, never with one function for both.
+   */
   hashrate: number;
+  /** Same per-engine unit as `hashrate`. */
   cpuHashrate: number;
   gpuHashrate: number;
   activeJobs: number;

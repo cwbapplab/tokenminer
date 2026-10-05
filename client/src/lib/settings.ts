@@ -30,8 +30,10 @@ export interface AppSettings {
 const STORAGE_KEY = "tokenminer.settings";
 
 export const DEFAULT_SETTINGS: AppSettings = {
-  apiBaseUrl: "http://localhost:5210",
-  stratumEndpoint: "localhost:3333",
+  // The dev stack binds 0.0.0.0, so the API and the proxy answer on the host's LAN address. These
+  // must match the interface holding the default route on the machine running the stack.
+  apiBaseUrl: "http://192.168.1.2:5210",
+  stratumEndpoint: "192.168.1.2:3333",
   quantus: {
     nodeAddr: "127.0.0.1:9833",
     authTokenFile: "",

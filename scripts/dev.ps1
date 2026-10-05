@@ -151,6 +151,38 @@ function Write-Fail {
     Write-Host "    [!!] $Message" -ForegroundColor Red
 }
 
+<#
+    The IPv4 addresses other machines on the network can use to reach this one, for printing the
+    reachable URLs now that everything binds 0.0.0.0.
+
+    Only interfaces carrying a default route are considered. Enumerating every address also turns up
+    virtual adapters (WSL, Hyper-V, VPN), whose 172.x addresses are not routable from elsewhere and
+    would send the operator to a dead end.
+#>
+function Get-NetworkAddress {
+    $interfaces = @(
+        Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.NextHop -ne '0.0.0.0' } |
+            Select-Object -ExpandProperty InterfaceIndex -Unique
+    )
+
+    if ($interfaces.Count -eq 0) {
+        # No route to the internet: nothing is reachable from elsewhere, so print the loopback form.
+        return @('localhost')
+    }
+
+    $addresses = @(
+        Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $interfaces -contains $_.InterfaceIndex } |
+            Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' } |
+            Select-Object -ExpandProperty IPAddress -Unique
+    )
+
+    if ($addresses.Count -eq 0) { return @('localhost') }
+
+    return $addresses
+}
+
 # --- .env -------------------------------------------------------------------------------------
 
 <#
@@ -613,13 +645,10 @@ function Start-Api {
     # The content root matters: run from the assembly's own directory and the app finds neither
     # appsettings.json nor appsettings.Development.json.
     $env:ASPNETCORE_CONTENTROOT = $ApiProjectDir
-    $env:ASPNETCORE_URLS = if ($Containers) {
-        # Bound beyond loopback so the containerised proxy can reach it.
-        "http://0.0.0.0:$ApiPort"
-    }
-    else {
-        "http://localhost:$ApiPort"
-    }
+    # Bound beyond loopback so the containerised proxy and anything else on the network can reach
+    # the API. The containerised proxy needs it, but the address is set unconditionally so native
+    # and container mode agree on what the API listens on.
+    $env:ASPNETCORE_URLS = "http://0.0.0.0:$ApiPort"
 
     # Serilog reads its level from configuration, so env beats appsettings.json.
     if ($Debug) {
@@ -637,7 +666,7 @@ function Start-Api {
         throw "The API did not become ready. See $(Join-Path $LogDir 'api.err.log')."
     }
 
-    Write-Ok "API listening on http://localhost:$ApiPort (pid $(Get-TrackedPid -Name 'api'))"
+    Write-Ok "API listening on http://0.0.0.0:$ApiPort (pid $(Get-TrackedPid -Name 'api'))"
 }
 
 function Start-Proxy {
@@ -766,7 +795,7 @@ function Start-Portal {
         throw "The management portal did not become reachable on port $PortalPort. See $(Join-Path $LogDir 'portal.err.log')."
     }
 
-    Write-Ok "management portal on http://localhost:$PortalPort (pid $(Get-TrackedPid -Name 'portal'))"
+    Write-Ok "management portal on http://0.0.0.0:$PortalPort (pid $(Get-TrackedPid -Name 'portal'))"
 }
 
 function Invoke-Up {
@@ -787,19 +816,30 @@ function Invoke-Up {
     Write-Host ''
     Write-Host '  Ready.' -ForegroundColor Green
     Write-Host ''
-    Write-Host "    API       http://localhost:$ApiPort"
-    Write-Host "    Swagger   http://localhost:$ApiPort/swagger"
-    Write-Host "    Health    http://localhost:$ApiPort/health/ready"
-    Write-Host "    Postgres  localhost:$($script:Settings.PostgresPort)"
-    Write-Host "    Stratum   localhost:$ProxyPort   <- point your miner here"
 
-    if ($MockPool) {
-        Write-Host "    Mock PRL  localhost:$MockPoolPearlPort"
-        Write-Host "    Mock QTC  localhost:$MockPoolQuantusPort"
+    $networkAddresses = Get-NetworkAddress
+
+    foreach ($address in $networkAddresses) {
+        Write-Host "    API       http://$address`:$ApiPort"
+        Write-Host "    Swagger   http://$address`:$ApiPort/swagger"
+        Write-Host "    Health    http://$address`:$ApiPort/health/ready"
+        Write-Host "    Stratum   $address`:$ProxyPort   <- point your miner here"
+
+        if ($MockPool) {
+            Write-Host "    Mock PRL  $address`:$MockPoolPearlPort"
+            Write-Host "    Mock QTC  $address`:$MockPoolQuantusPort"
+        }
+
+        if ($Portal) {
+            Write-Host "    Portal    http://$address`:$PortalPort"
+        }
     }
 
-    if ($Portal) {
-        Write-Host "    Portal    http://localhost:$PortalPort"
+    Write-Host "    Postgres  localhost:$($script:Settings.PostgresPort)  (loopback only, docker)"
+
+    if ($networkAddresses.Count -gt 1) {
+        Write-Host ''
+        Write-Detail 'More than one network address is active; the ports above are open on all of them.'
     }
 
     if (-not $Containers) {

@@ -30,8 +30,10 @@ cargo check --features pearl
 
 - Node 20+ and npm
 - Rust ≥ 1.93 (see `src-tauri/rust-toolchain.toml`)
-- The TokenMiner API running (default `http://localhost:5210`) — see the repo
-  root `scripts/dev.ps1`
+- The TokenMiner API running (default `http://192.168.1.2:5210`) — see the repo
+  root `scripts/dev.ps1`. The stack binds `0.0.0.0`, so that LAN address is what
+  other machines reach it on. Override it in **Settings → API → API base URL** if
+  the host's address differs.
 
 ## Setup
 

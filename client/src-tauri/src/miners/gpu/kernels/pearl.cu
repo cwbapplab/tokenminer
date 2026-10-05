@@ -358,6 +358,20 @@ extern "C" __global__ void tokenminer_fill_i8(
 #define POW_DP4A 0
 #endif
 
+// Whether the `mma` path loads its fragments with `ldmatrix` instead of four `LDS.32` apiece.
+//
+// `ldmatrix` arrived in Turing, so every architecture this miner ships an `mma` path for has it and
+// there is no architecture here for which the fallback would be the only option -- it exists to be
+// *measurable*, not to be portable. `POW_FORCE_LDS32` selects it on any card, for the same reason
+// `POW_FORCE_DP4A` exists: two implementations of a consensus-critical fold, one of which has to be
+// runnable on whatever card the developer happens to have, or the other ships having only ever been
+// compiled.
+#if defined(POW_FORCE_LDS32) || POW_DP4A
+#define POW_LDMATRIX 0
+#else
+#define POW_LDMATRIX 1
+#endif
+
 // k staged per tile. `mma.m16n8k32` takes k = 32, so this is exactly one instruction's worth and a
 // staged buffer is one fragment deep. The DP4A fold consumes the same 32 bytes as four four-byte
 // dots per lane, so the staging, the step count and the fold schedule are shared by both paths and
@@ -425,6 +439,42 @@ __device__ __forceinline__ void pow_mma(unsigned int* d, unsigned int a0, unsign
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+#endif
+
+// One `ldmatrix.x4` loads the four registers an `mma` fragment pair wants out of a 16-row, 32-byte
+// shared tile -- the A operand of one `mma`, or the B operand of two.
+//
+// The mapping is not a coincidence and it is the only reason this works without a swizzle. Read the
+// tile as four 8x8 matrices of 16-bit elements -- rows 0-7 / bytes 0-15, rows 8-15 / bytes 0-15,
+// rows 0-7 / bytes 16-31, rows 8-15 / bytes 16-31 -- and `ldmatrix` hands lane `l` the two 16-bit
+// elements at row `l >> 2`, columns `(l & 3) * 2` and `+1`, which is four bytes at
+// `(l & 3) * 4 .. + 3`. Those four matrices are exactly `a0..a3` for A, and for B exactly the
+// `b0`/`b1` of both eight-column halves at once. So one instruction replaces four `LDS.32`.
+//
+// Lane `l` supplies the address of row `(l & 7)` of matrix `l >> 3`, which is the row/offset pair
+// below -- and note it is the same pair for A and for B, so there is one loader rather than two.
+//
+// **No swizzle is needed, and that is worth being sure about rather than assuming.** `ldmatrix`
+// reads eight rows of 16 bytes per matrix, so a matrix is conflict-free exactly when its eight rows
+// start on 32 distinct banks. `POW_SMEM_STRIDE` is 48 bytes = 12 banks, and twelve divides evenly
+// into thirty-two's factors, so rows 0-7 start at banks 0, 12, 24, 4, 16, 28, 8, 20 -- eight
+// distinct starts, and each row's four banks are disjoint from the rest. The pitch was chosen to make
+// the `LDS.32` path conflict-free and it happens to satisfy `ldmatrix` too; the two choices are not
+// in tension and there is nothing to buy from replacing it.
+//
+// `smem` must be 16-byte aligned, which the 48-byte stride preserves for every row and offset here,
+// and which the `__shared__` declarations state explicitly because the `cp.async` above needs it too.
+#if POW_LDMATRIX
+__device__ __forceinline__ void pow_ldmatrix_x4(unsigned int* out, const signed char* smem,
+                                                int lane) {
+    const int row = (lane & 7) + 8 * ((lane >> 3) & 1);
+    const int koff = (lane >> 4) * 16;
+    const unsigned int addr =
+        (unsigned int)__cvta_generic_to_shared(smem + row * POW_SMEM_STRIDE + koff);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3])
+                 : "r"(addr));
 }
 #endif
 
@@ -543,16 +593,22 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
         unsigned int tiles_per_region,
         int k,
         int rank) {
-    __shared__ signed char sA[POW_STAGES][POW_BLOCK_ROWS * 16 * POW_SMEM_STRIDE];
-    __shared__ signed char sB[POW_STAGES][POW_BLOCK_COLS * 16 * POW_SMEM_STRIDE];
+    // `__align__(16)` because both consumers of these buffers require it and neither can supply it: the
+// staging writes 16 bytes at a time with `cp.async`, and `ldmatrix` addresses 16-byte row starts.
+__shared__ __align__(16) signed char sA[POW_STAGES][POW_BLOCK_ROWS * 16 * POW_SMEM_STRIDE];
+    __shared__ __align__(16) signed char sB[POW_STAGES][POW_BLOCK_COLS * 16 * POW_SMEM_STRIDE];
     __shared__ unsigned int sT[POW_WARPS][POW_BLOCK_COLS][POW_TRANSCRIPT_WORDS];
 
     const int tid = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
+#if POW_DP4A || !POW_LDMATRIX
     const int lane_group = lane >> 2;      // which row of the 8 this lane serves
+#endif
+#if POW_DP4A || !POW_LDMATRIX
     const int lane_k = (lane & 3) * 4;     // and which four k values
-#if !POW_DP4A
+#endif
+#if !POW_DP4A && !POW_LDMATRIX
     const int lane_k_hi = lane_k + 16;
 #endif
 
@@ -718,6 +774,21 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
             }
 #else
             // Two `mma` tiles of eight columns, since m16n8k32 produces an 8-wide tile.
+#if POW_LDMATRIX
+            // Nine `LDSM` for the thirty-six `LDS.32` this used to take. One for A, loaded once and
+            // reused across all eight tile columns -- which is what the rectangle's rows axis buys --
+            // and one per tile column for B, each covering both eight-column halves at once.
+            unsigned int a[4];
+            pow_ldmatrix_x4(a, sA[rd] + warp * 16 * POW_SMEM_STRIDE, lane);
+
+            #pragma unroll
+            for (int t = 0; t < POW_BLOCK_COLS; ++t) {
+                unsigned int b[4];
+                pow_ldmatrix_x4(b, sB[rd] + t * 16 * POW_SMEM_STRIDE, lane);
+                pow_mma(acc[t][0], a[0], a[1], a[2], a[3], b[0], b[2]);
+                pow_mma(acc[t][1], a[0], a[1], a[2], a[3], b[1], b[3]);
+            }
+#else
             const signed char* a_row = sA[rd] + (warp * 16 + lane_group) * POW_SMEM_STRIDE;
             const signed char* a_row_hi = a_row + 8 * POW_SMEM_STRIDE;
 
@@ -736,6 +807,7 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
                             pow_ld32(b_row + lane_k), pow_ld32(b_row + lane_k_hi));
                 }
             }
+#endif
 #endif
         }
 

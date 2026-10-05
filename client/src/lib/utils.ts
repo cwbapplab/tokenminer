@@ -35,29 +35,29 @@ export function formatHashrate(hashesPerSecond: number | null | undefined): stri
 }
 
 /**
- * Pearl's hashrate, in the only unit it has: candidate tiles per second.
+ * Pearl's hashrate, in TH/s — the unit every other Pearl miner reports.
  *
- * A Pearl hash is one jackpot digest over one 16×16 candidate tile — `compute_jackpot_hash` runs
- * once per tile and `check_jackpot_against_nbits` compares that one digest — so a tile *is* a hash
- * and the number needs no scaling. What it must not borrow is the "H/s" suffix: one of these hashes
- * is 16 × 16 × 4096 int8 MACs, which is not one of Quantus's, so the same suffix on both engines
- * invites a comparison between quantities that have no relationship.
+ * The backend does the conversion, not this: one candidate tile is one 16×16 output of the full
+ * k-deep GEMM, so it is `16 * 16 * k` MACs and `tiles/s * 16 * 16 * k / 1e12` is TH/s. That is the
+ * reference miner's own arithmetic — `TH_PER_MTILE = (1 << 20) / 1e6`, annotated "1 Mtile/s ~= 1.0486
+ * TH/s" (`tests/bench_split.py:20`) — and its `1 << 20` is just `16 * 16 * 4096` written out. This
+ * function only chooses a suffix and a number of decimals.
+ *
+ * It must not be folded into `formatHashrate`. That one is a Quantus H/s counter whose "TH/s" is
+ * 10^12 of *Quantus* hashes; a Pearl "TH" is 10^12 of int8 MACs, which is not a Quantus hash, so the
+ * two suffixes would invite a comparison between quantities with no relationship. The dashboard
+ * already refuses to ratio them — its "share" is a count of running engines — so the units are free
+ * to differ; what must not happen is one function silently relabelling both.
  */
-export function formatPearlRate(tilesPerSecond: number | null | undefined): string {
-  if (tilesPerSecond === null || tilesPerSecond === undefined || tilesPerSecond <= 0) {
-    return "0 tiles/s";
+export function formatPearlRate(thPerSecond: number | null | undefined): string {
+  // `!(x > 0)` rather than `x <= 0` so a NaN reading fails closed as 0 instead of printing "NaN".
+  if (thPerSecond === null || thPerSecond === undefined || !(thPerSecond > 0)) {
+    return "0 TH/s";
   }
-  const units: Array<[number, string]> = [
-    [1e9, "Gtiles/s"],
-    [1e6, "Mtiles/s"],
-    [1e3, "Ktiles/s"],
-  ];
-  for (const [scale, unit] of units) {
-    if (tilesPerSecond >= scale) {
-      return `${(tilesPerSecond / scale).toFixed(2)} ${unit}`;
-    }
+  if (thPerSecond >= 100) {
+    return `${thPerSecond.toFixed(1)} TH/s`;
   }
-  return `${tilesPerSecond.toFixed(2)} tiles/s`;
+  return `${thPerSecond.toFixed(2)} TH/s`;
 }
 
 export function formatDateTime(value: string | null | undefined): string {

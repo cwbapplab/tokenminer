@@ -37,6 +37,66 @@ const AGENT: &str = concat!("tokenminer-desktop/", env!("CARGO_PKG_VERSION"));
 /// line read as a staircase rather than a rate.
 const PROGRESS_EVERY: u64 = 5;
 
+/// The Pearl hashrate window.
+///
+/// A rate is tiles divided by time, and the only honest question is *which* time. Between two
+/// searches the miner assembles and verifies a share, encodes it, sends it, and waits for the pool
+/// to hand over the next job -- and sleeps for a quarter of a second to a second whenever no usable
+/// job is in hand. None of that folds a tile, so none of it belongs in the denominator of a rate
+/// whose numerator counts only tiles. A share costs ~490ms to assemble on the way out, so at any
+/// ordinary share rate that is not a rounding error.
+///
+/// Separate from the cadence: the window is reported every [`PROGRESS_EVERY`] seconds of wall clock
+/// because that is how fast the UI can show a change, and it is measured over search time because
+/// that is what the number describes.
+#[derive(Debug)]
+struct RateWindow {
+    tiles: u64,
+    /// The engine's cumulative tile count as of the last window close, so a caller's running total
+    /// can be differenced against it without the caller tracking that itself.
+    seen_tiles: u64,
+    searched: f64,
+    opened_at: std::time::Instant,
+}
+
+impl RateWindow {
+    fn new() -> Self {
+        Self {
+            tiles: 0,
+            seen_tiles: 0,
+            searched: 0.0,
+            opened_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Record one completed search: `total_tiles` is the engine's cumulative count and `seconds` is
+    /// how long that search took.
+    fn add(&mut self, total_tiles: u64, seconds: f64) {
+        self.tiles += total_tiles.saturating_sub(self.seen_tiles);
+        self.seen_tiles = total_tiles;
+        self.searched += seconds;
+    }
+
+    /// The rate to publish if the reporting cadence has elapsed, closing the window either way.
+    ///
+    /// `Some(rate)` means publish it. A zero-length search is possible -- a job superseded before
+    /// the first batch launches -- so the divisor is guarded rather than assumed.
+    fn take_if_due(&mut self, now: std::time::Instant) -> Option<f64> {
+        if now.duration_since(self.opened_at).as_secs_f64() < PROGRESS_EVERY as f64 {
+            return None;
+        }
+        let rate = if self.searched > 0.0 {
+            self.tiles as f64 / self.searched
+        } else {
+            0.0
+        };
+        self.tiles = 0;
+        self.searched = 0.0;
+        self.opened_at = now;
+        Some(rate)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrlConfig {
@@ -456,9 +516,7 @@ fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
             }
         };
 
-        let mut total_tiles = 0u64;
-        let mut reported_tiles = 0u64;
-        let mut reported_at = std::time::Instant::now();
+        let mut rate = RateWindow::new();
         // A job whose target we cannot use is retried only after a new job arrives, so one bad
         // notify does not spam the console.
         let mut unusable_job: Option<String> = None;
@@ -526,7 +584,13 @@ fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
                     || shared.current_job_id().as_deref() != Some(job_id.as_str())
             };
 
-            let found = match miner.search(&header, cert_version, bound, &stopped) {
+            let search_started = std::time::Instant::now();
+            let searched_for = miner.search(&header, cert_version, bound, &stopped);
+            // Recorded before the result is unwrapped, so a search that ends in an error has still
+            // been paid for and still counts against the interval it was spent in.
+            rate.add(miner.tiles(), search_started.elapsed().as_secs_f64());
+
+            let found = match searched_for {
                 Ok(found) => found,
                 Err(error) => {
                     shared.log("error", format!("GPU mining failed: {error}"));
@@ -535,28 +599,20 @@ fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
                 }
             };
 
-            // Report hashrate off the tile count, however the search ended.
-            total_tiles += miner.tiles().saturating_sub(reported_tiles);
-            reported_tiles = miner.tiles();
-            let elapsed = reported_at.elapsed().as_secs_f64();
-            if elapsed >= PROGRESS_EVERY as f64 {
-                let rate = total_tiles as f64 / elapsed;
+            if let Some(tiles_per_second) = rate.take_if_due(std::time::Instant::now()) {
+                let th_per_second = config.mining.th_per_second(tiles_per_second);
                 update_status(&shared.app, &shared.status, |s| {
-                    // A Pearl hash is one jackpot digest: `compute_jackpot_hash` runs once per
-                    // candidate 16x16 tile and `check_jackpot_against_nbits` compares that one
-                    // digest against the scaled target. So a tile *is* a hash, and tiles per second
-                    // is the hashrate in the consensus's own unit — which is also the only one
-                    // there is, since there is no second thing being counted.
+                    // TH/s, the unit every other Pearl miner prints and the one the reference
+                    // derives from its tile count the same way — see
+                    // `PearlMining::th_per_second`.
                     //
                     // `hashrate` is the field the dashboard's Pearl card reads; `gpu_hashrate` is
                     // the same number, filed separately because that is the whole engine. Setting
                     // only the second left the card reading zero forever, and a Pearl engine
                     // running at full tilt looked identical to one that had never started.
-                    s.hashrate = rate;
-                    s.gpu_hashrate = rate;
+                    s.hashrate = th_per_second;
+                    s.gpu_hashrate = th_per_second;
                 });
-                total_tiles = 0;
-                reported_at = std::time::Instant::now();
             }
 
             let Some(proof) = found else {
@@ -609,6 +665,73 @@ fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The property the window exists for: time that was not spent folding does not reach the
+    /// divisor. A hashrate is tiles per second of *mining*, and the loop spends real seconds
+    /// assembling shares, verifying them and waiting for jobs.
+    #[test]
+    fn the_rate_divides_by_search_time_and_not_by_wall_clock() {
+        let start = std::time::Instant::now();
+        let mut window = RateWindow::new();
+        window.opened_at = start;
+
+        // Two searches, five seconds of searching between them, and ten seconds of wall clock --
+        // the extra five being a share assembled and verified, which is what the loop actually does.
+        window.add(1_000_000, 2.5);
+        let midway = start + Duration::from_secs(3);
+        window.add(3_000_000, 2.5);
+
+        // Not due yet: the cadence is five seconds of wall clock, and only three have passed.
+        assert_eq!(window.take_if_due(midway), None);
+
+        // Due now. The rate is 3,000,000 tiles over 5.0 seconds of search -- 600,000/s -- and *not*
+        // over the 10 seconds of wall clock, which would read 300,000/s and blame the pool for half
+        // the hashrate the card was producing.
+        let rate = window
+            .take_if_due(start + Duration::from_secs(10))
+            .expect("ten seconds is past the cadence");
+        assert!(
+            (rate - 600_000.0).abs() < 1.0,
+            "expected 600000 tiles/s from search time, got {rate}"
+        );
+
+        // The window closed, so the next report starts from zero rather than double-counting.
+        assert_eq!(window.tiles, 0);
+        assert_eq!(window.searched, 0.0);
+    }
+
+    /// A search can return without folding anything -- a job superseded before the first batch
+    /// launches -- so an interval can close with no search time in it. Dividing by that is not an
+    /// error to propagate into the UI; the number is simply zero.
+    #[test]
+    fn a_window_with_no_search_time_reports_zero_rather_than_dividing_by_zero() {
+        let start = std::time::Instant::now();
+        let mut window = RateWindow::new();
+        window.opened_at = start;
+        window.add(0, 0.0);
+        assert_eq!(window.take_if_due(start + Duration::from_secs(6)), Some(0.0));
+    }
+
+    /// The engine's tile count is cumulative and never reset, so the window differences it. If it
+    /// counted the running total instead, the second search in an interval would report its own
+    /// total plus the previous one and the rate would climb without bound.
+    #[test]
+    fn a_cumulative_tile_count_is_differenced_not_summed() {
+        let start = std::time::Instant::now();
+        let mut window = RateWindow::new();
+        window.opened_at = start;
+
+        window.add(500, 1.0); // engine total is now 500
+        window.add(900, 1.0); // and now 900: this search folded 400, not 900
+
+        let rate = window
+            .take_if_due(start + Duration::from_secs(6))
+            .expect("six seconds is past the cadence");
+        assert!(
+            (rate - 450.0).abs() < 0.5,
+            "expected 450 tiles/s from 900 tiles folded, got {rate}"
+        );
+    }
 
     #[test]
     fn reads_a_pearl_job_off_a_notify() {

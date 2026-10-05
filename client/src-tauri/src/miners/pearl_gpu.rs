@@ -743,7 +743,7 @@ mod tests {
         // Read it as "this kernel's share of the card", not "this kernel's rate". Two things move it
         // and neither is the kernel: the search saturates the GPU, so the 252W cap puts the SM clock
         // near 2700MHz rather than its 3090MHz boost, and anything else mining the same device takes
-        // half of it. On the dev box this number halved from 64.7M to 32.4M tiles/s purely because a
+        // half of it. On the dev box this number halved from 67.8 to 34.0 TH/s purely because a
         // second `tokenminer-desktop` was started on the same GPU, and moved back the moment that
         // one stopped.
         let before = miner.tiles();
@@ -758,21 +758,25 @@ mod tests {
         let elapsed = started.elapsed();
         let tiles = miner.tiles() - before;
         eprintln!(
-            "sustained: {} tiles in {:?} — {:.0} tiles/s, {:.1} GMAC/s",
+            "sustained: {} tiles in {:?} — {:.2} TH/s",
             tiles,
             elapsed,
-            tiles as f64 / elapsed.as_secs_f64(),
-            tiles as f64 * 16.0 * 16.0 * 4096.0 / elapsed.as_secs_f64() / 1e9,
+            miner.mining.th_per_second(tiles as f64 / elapsed.as_secs_f64()),
         );
 
         // Where the time above actually goes, because "sustained" is an average over a window that
-        // contains one whole attempt's setup plus the start of a second, and setup is a different
-        // cost from the fold. Tuning the wrong one is how a miner spends a week on the fold and
-        // keeps the same wall clock.
+        // contains several whole attempts' setup, and setup is a different cost from the fold.
+        // Tuning the wrong one is how a miner spends a week on the fold and keeps the same wall
+        // clock.
+        //
+        // All four of `attempt`'s steps, because the first cut of this measured only two of them and
+        // reported setup at 1% -- on a breakdown that silently omitted the commitment chain, which
+        // is the one step that reads a gigabyte and the one step that has to hash it. A breakdown
+        // that adds up to less than the thing it is decomposing is not a breakdown.
         //
         // Measured here rather than in `attempt` itself, so production carries no timing code. The
         // seeds are wrong and the noise is whatever the last attempt left behind, which is fine:
-        // the question is how long the two passes take, not what they produce.
+        // the question is how long each pass takes, not what they produce.
         let GpuMiner {
             backend,
             mining,
@@ -793,6 +797,40 @@ mod tests {
         // the enqueue. Thirteen microseconds for a gigabyte of Philox is not a fast fill.
         backend.synchronize().expect("the device drains");
         let fill = started.elapsed();
+
+        let started = Instant::now();
+        let (b_noise_seed, a_noise_seed) = backend
+            .commitment_seeds(
+                &workspace.a,
+                &workspace.bt,
+                [0x5a; 32],
+                m as u32,
+                n as u32,
+                seed_derivation_for(CERT_VERSION).expect("the certificate version is one we know"),
+            )
+            .expect("the commitment runs");
+        backend.synchronize().expect("the device drains");
+        let commit = started.elapsed();
+
+        let started = Instant::now();
+        backend
+            .fill_noise(
+                &mut workspace.e_al,
+                &mut workspace.ear,
+                &mut workspace.e_bl,
+                &mut workspace.e_br,
+                &a_noise_seed,
+                &b_noise_seed,
+                0,
+                0,
+                m,
+                n,
+                k,
+                rank,
+            )
+            .expect("the noise draw runs");
+        backend.synchronize().expect("the device drains");
+        let draw = started.elapsed();
 
         let started = Instant::now();
         backend
@@ -821,16 +859,20 @@ mod tests {
         let noise = started.elapsed();
 
         // What the fold costs for the same grid, so the two are comparable: the tile grid is
-        // `(m/16) * (n/16)` tiles and the sustained rate above is tiles per second.
+        // `(m/16) * (n/16)` tiles, and the tile rate behind the TH/s above is what it has to be
+        // divided by.
         let grid_tiles = (m / 16) * (n / 16);
         let folding =
             Duration::from_secs_f64(grid_tiles as f64 / (tiles as f64 / elapsed.as_secs_f64()));
+        let setup = fill + commit + draw + noise;
         eprintln!(
-            "per attempt: fill 2 x {} MiB {fill:?}, noise-apply 2 x {} MiB {noise:?}, folding the \
-             whole {grid_tiles}-tile grid {folding:?} -- setup is {:.0}% of one attempt",
+            "per attempt: fill 2 x {} MiB {fill:?}, commitment over 2 x {} MiB {commit:?}, noise \
+             draw {draw:?}, noise-apply 2 x {} MiB {noise:?} -- setup {setup:?} against a \
+             {folding:?} fold, so {:.1}% of an attempt",
+            m * k / (1 << 20),
             m * k / (1 << 20),
             n * k / (1 << 20),
-            100.0 * (fill + noise).as_secs_f64() / (folding + fill + noise).as_secs_f64(),
+            100.0 * setup.as_secs_f64() / (folding + setup).as_secs_f64(),
         );
 
         // And what a share's assembly is made of, since it costs several times a whole grid's fold.
@@ -856,6 +898,29 @@ mod tests {
              (root {:02x?}, {} leaves)",
             tree.root(),
             (m * k).div_ceil(1024),
+        );
+
+        // And what the rest of the submit path costs, because every one of these sits between two
+        // searches with no tiles folded during it. The reported hashrate divides tiles by wall
+        // clock, so all of it is charged to the denominator; a share that takes three seconds to
+        // verify is three seconds of not mining.
+        //
+        // Verified against `U256::MAX` because that is the bound the proof above was found under:
+        // the proof is real, so this measures the verifier's actual cost rather than its failure
+        // path, which is much cheaper and would flatter the number.
+        let started = Instant::now();
+        verify_share_locally(&test_header(), CERT_VERSION, &proof, U256::MAX)
+            .expect("the proof the first batch produced verifies");
+        let verify = started.elapsed();
+
+        let started = Instant::now();
+        let encoded = crate::miners::pearl_mining::encode_plain_proof(&proof, true)
+            .expect("the proof encodes");
+        let encode = started.elapsed();
+        eprintln!(
+            "per share: verify {verify:?}, gzip+bincode encode {encode:?} ({} chars) -- \
+             assembly and submission, none of which folds a tile",
+            encoded.len(),
         );
     }
 

@@ -63,6 +63,35 @@ impl Default for PearlMining {
     }
 }
 
+impl PearlMining {
+    /// Tiles per second to TH/s — the unit Open-Pearl-Miner and every other Pearl miner reports.
+    ///
+    /// One candidate tile is one 16x16 output of the full k-deep GEMM, so it is `16 * 16 * k` MACs,
+    /// and consensus counts work in MACs: a TH is 10^12 of them. The reference converts exactly this
+    /// way, and writes the same constant twice — `TH_PER_MTILE = (1 << 20) / 1e6`, annotated
+    /// "1 Mtile/s ~= 1.0486 TH/s" (`tests/bench_split.py:20`), and
+    /// `TH_PER_REGION = tiles * (1 << 20) / 1e12` (`tests/bench_capi.py:18`). Its `1 << 20` is
+    /// just `16 * 16 * 4096` written out, which is why this takes the depth from `k` instead of
+    /// hardcoding it: at a k this miner also allows, a tile is twice the work and has to be counted
+    /// as such. At the shipped default the two agree exactly, so the numbers are comparable.
+    ///
+    /// The 16x16 is not configurable here because it is not this module's choice: the grid kernel
+    /// folds 16x16 tiles, the patterns below are `range(16)` because a hash tile must span one, and
+    /// the verifier prices a tile as `hash_tile_h * hash_tile_w * dot_product_length` — so this
+    /// counts the work the card actually did and it is the work consensus pays for. The tile is
+    /// hardcoded rather than read off `rows_pattern.len()` precisely because a configuration with
+    /// some other tile is one the kernel does not implement; reading the length would report a
+    /// consensus-priced rate for machine throughput that never happened, and report it silently.
+    ///
+    /// This is not a cosmetic rename. A card folding 56 TH/s is folding about 5.3e7 tiles/s, so
+    /// publishing the tile rate as the hashrate put our figures three orders of magnitude from every
+    /// other Pearl miner's — including the reference's, the only other Pearl miner whose
+    /// architecture we can actually check.
+    pub fn th_per_second(&self, tiles_per_second: f64) -> f64 {
+        tiles_per_second * (16.0 * 16.0 * self.k as f64) / 1e12
+    }
+}
+
 pub fn seed_derivation_for(cert_version: u32) -> Result<SeedDerivation, String> {
     Ok(CertificateVersion::try_from(cert_version)
         .map_err(|e| e.to_string())?
@@ -153,6 +182,50 @@ mod tests {
     /// A real header captured from a `mining.notify`.
     const HEADER: &str = "0000002040855504f7a9fc1682784e9b3f1d185a9f2ffb84efa2b81460e2b726ae\
 77656dd7a5610c81c03527b58bba629e7f58a84a5a1295776120109f9d2bfad0ef7438f9c4c06a04810018";
+
+    /// At the shipped depth our conversion has to *be* the reference's constant, not merely the
+    /// right order of magnitude — a rate off by a power of ten still reads as a hashrate, and is
+    /// wrong in the only way nobody notices.
+    ///
+    /// The reference prints the constant itself: `TH_PER_MTILE = (1 << 20) / 1e6`, annotated
+    /// "1 Mtile/s ~= 1.0486 TH/s" (`tests/bench_split.py:20`). Both sides of the comparison below
+    /// divide by the same `1e6`, so agreeing to 12 significant digits is agreement to the last bit
+    /// the rounding can express.
+    #[test]
+    fn one_mtile_per_second_is_the_references_own_tera_hash_constant() {
+        let th_per_second = PearlMining::default().th_per_second(1e6);
+        assert!(
+            (th_per_second - (1u64 << 20) as f64 / 1e6).abs() < 1e-12,
+            "1 Mtile/s should be {} TH/s, got {th_per_second}",
+            (1u64 << 20) as f64 / 1e6
+        );
+    }
+
+    /// A tile is `16 * 16 * k` MACs, so the same tile rate at twice the GEMM depth is twice the
+    /// hashrate. That is what the depth in [`PearlMining::th_per_second`] buys over hardcoding the
+    /// reference's `1 << 20`, which is only right at the depth the reference happens to use.
+    #[test]
+    fn a_tile_is_counted_as_the_work_the_gemms_depth_implies() {
+        let mut deep = PearlMining::default();
+        deep.k *= 2;
+
+        let tiles_per_second = 5.0e7;
+        let base = PearlMining::default().th_per_second(tiles_per_second);
+        assert!(
+            (deep.th_per_second(tiles_per_second) - 2.0 * base).abs() < base * 1e-12,
+            "twice the depth must be twice the hashrate: {base} then {}",
+            deep.th_per_second(tiles_per_second)
+        );
+
+        // The magnitude, which is the point of the change: 5e7 tiles/s is ~52 TH/s, so the ~56 TH/s
+        // the app reads on the dev box is ~5.3e7 tiles/s — and printing that tile rate as the
+        // hashrate put our figures three orders of magnitude from every other Pearl miner's.
+        assert!(
+            (base - 52.4288).abs() < 1e-3,
+            "5e7 tiles/s at the default depth is 52.4288 TH/s, got {base}"
+        );
+        assert_eq!(PearlMining::default().th_per_second(0.0), 0.0);
+    }
 
     /// The shipped default has to pass the verifier's constraint list, checked here directly
     /// rather than through a mined proof.
