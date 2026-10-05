@@ -27,7 +27,15 @@ use tauri::AppHandle;
 use crate::miners::{emit_log, emit_status, now, MinerKind, MinerState, MinerStatus};
 
 const AGENT: &str = concat!("tokenminer-desktop/", env!("CARGO_PKG_VERSION"));
-const PROGRESS_EVERY: u64 = 25;
+
+/// Seconds between hashrate reports to the UI.
+///
+/// Five, because that is the search's own slice (`MAX_SECONDS_PER_SEARCH`): the loop comes back to
+/// here at least that often, so this is as fast as the number can honestly change. It used to be 25,
+/// which is faster than nothing and slower than the dashboard can show — the chart's window is 60
+/// seconds, so a 25-second cadence put two or three distinct values in the whole graph and the Pearl
+/// line read as a staircase rather than a rate.
+const PROGRESS_EVERY: u64 = 5;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,8 +72,15 @@ fn job_from_notify(params: &Value) -> Option<Job> {
     Some(Job {
         job_id: object.get("job_id").and_then(Value::as_str)?.to_string(),
         header_hex: object.get("header").and_then(Value::as_str)?.to_string(),
-        cert_version: object.get("cert_version").and_then(Value::as_u64).unwrap_or(2) as u32,
-        target: object.get("target").and_then(Value::as_str).unwrap_or_default().to_string(),
+        cert_version: object
+            .get("cert_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(2) as u32,
+        target: object
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -105,11 +120,17 @@ pub fn read_authorize_result(response: &sp_protocol::Response) -> Result<ProofEn
 
     match &response.result {
         Some(Value::Bool(true)) => Ok(ProofEncoding::Plain),
-        Some(Value::Bool(false)) | None => Err("the proxy did not accept the authorize".to_string()),
+        Some(Value::Bool(false)) | None => {
+            Err("the proxy did not accept the authorize".to_string())
+        }
         Some(Value::Object(object)) => {
             let v2 = object.get("type").and_then(Value::as_str) == Some("v2");
 
-            Ok(if v2 { ProofEncoding::Gzip } else { ProofEncoding::Plain })
+            Ok(if v2 {
+                ProofEncoding::Gzip
+            } else {
+                ProofEncoding::Plain
+            })
         }
         Some(other) => Err(format!("unexpected authorize result: {other}")),
     }
@@ -139,7 +160,11 @@ impl Shared {
     }
 }
 
-fn update_status(app: &AppHandle, status: &Arc<Mutex<MinerStatus>>, apply: impl FnOnce(&mut MinerStatus)) {
+fn update_status(
+    app: &AppHandle,
+    status: &Arc<Mutex<MinerStatus>>,
+    apply: impl FnOnce(&mut MinerStatus),
+) {
     let Ok(mut current) = status.lock() else {
         return;
     };
@@ -178,7 +203,11 @@ pub fn spawn(
     })
 }
 
-async fn run(app: &AppHandle, config: &PrlConfig, status: &Arc<Mutex<MinerStatus>>) -> Result<(), String> {
+async fn run(
+    app: &AppHandle,
+    config: &PrlConfig,
+    status: &Arc<Mutex<MinerStatus>>,
+) -> Result<(), String> {
     emit_log(
         app,
         MinerKind::Pearl,
@@ -231,7 +260,10 @@ async fn run(app: &AppHandle, config: &PrlConfig, status: &Arc<Mutex<MinerStatus
         app,
         MinerKind::Pearl,
         "info",
-        format!("→ authorize wallet={} worker={}", config.wallet, config.worker),
+        format!(
+            "→ authorize wallet={} worker={}",
+            config.wallet, config.worker
+        ),
     );
 
     // Writer: every proof the miner produces goes out on this connection.
@@ -260,7 +292,12 @@ async fn run(app: &AppHandle, config: &PrlConfig, status: &Arc<Mutex<MinerStatus
         let message = match Message::parse(&line) {
             Ok(message) => message,
             Err(_) => {
-                emit_log(app, MinerKind::Pearl, "debug", format!("← (unparsed) {line}"));
+                emit_log(
+                    app,
+                    MinerKind::Pearl,
+                    "debug",
+                    format!("← (unparsed) {line}"),
+                );
                 continue;
             }
         };
@@ -268,7 +305,12 @@ async fn run(app: &AppHandle, config: &PrlConfig, status: &Arc<Mutex<MinerStatus
         match message {
             Message::Notification(notification) if notification.method == METHOD_NOTIFY => {
                 let Some(job) = job_from_notify(&notification.params) else {
-                    emit_log(app, MinerKind::Pearl, "debug", "← mining.notify (unrecognised params)");
+                    emit_log(
+                        app,
+                        MinerKind::Pearl,
+                        "debug",
+                        "← mining.notify (unrecognised params)",
+                    );
                     continue;
                 };
 
@@ -326,16 +368,26 @@ async fn run(app: &AppHandle, config: &PrlConfig, status: &Arc<Mutex<MinerStatus
                         s.state = MinerState::Running;
                         s.workers = 1;
                     });
-                    shared.set_message(format!("authorized as {}.{}", config.wallet, config.worker));
+                    shared
+                        .set_message(format!("authorized as {}.{}", config.wallet, config.worker));
                     continue;
                 }
 
                 if let Some(id) = response.id.as_u64() {
-                    let job_id = shared.pending.lock().ok().and_then(|mut pending| pending.remove(&id));
+                    let job_id = shared
+                        .pending
+                        .lock()
+                        .ok()
+                        .and_then(|mut pending| pending.remove(&id));
 
                     if let Some(job_id) = job_id {
                         if response.is_accepted() {
-                            emit_log(app, MinerKind::Pearl, "info", format!("✓ share accepted ({job_id})"));
+                            emit_log(
+                                app,
+                                MinerKind::Pearl,
+                                "info",
+                                format!("✓ share accepted ({job_id})"),
+                            );
                             shared.set_message(format!("share accepted ({job_id})"));
                         } else {
                             emit_log(
@@ -344,7 +396,11 @@ async fn run(app: &AppHandle, config: &PrlConfig, status: &Arc<Mutex<MinerStatus
                                 "warn",
                                 format!(
                                     "✗ share rejected ({job_id}): {}",
-                                    response.error.as_ref().map(Value::to_string).unwrap_or_else(|| "unknown".into())
+                                    response
+                                        .error
+                                        .as_ref()
+                                        .map(Value::to_string)
+                                        .unwrap_or_else(|| "unknown".into())
                                 ),
                             );
                             shared.set_message(format!("share rejected ({job_id})"));
@@ -353,7 +409,12 @@ async fn run(app: &AppHandle, config: &PrlConfig, status: &Arc<Mutex<MinerStatus
                 }
             }
             Message::Request(request) => {
-                emit_log(app, MinerKind::Pearl, "debug", format!("← {} {}", request.method, request.params));
+                emit_log(
+                    app,
+                    MinerKind::Pearl,
+                    "debug",
+                    format!("← {} {}", request.method, request.params),
+                );
             }
         }
     }
@@ -479,8 +540,20 @@ fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
             reported_tiles = miner.tiles();
             let elapsed = reported_at.elapsed().as_secs_f64();
             if elapsed >= PROGRESS_EVERY as f64 {
+                let rate = total_tiles as f64 / elapsed;
                 update_status(&shared.app, &shared.status, |s| {
-                    s.gpu_hashrate = total_tiles as f64 / elapsed;
+                    // A Pearl hash is one jackpot digest: `compute_jackpot_hash` runs once per
+                    // candidate 16x16 tile and `check_jackpot_against_nbits` compares that one
+                    // digest against the scaled target. So a tile *is* a hash, and tiles per second
+                    // is the hashrate in the consensus's own unit — which is also the only one
+                    // there is, since there is no second thing being counted.
+                    //
+                    // `hashrate` is the field the dashboard's Pearl card reads; `gpu_hashrate` is
+                    // the same number, filed separately because that is the whole engine. Setting
+                    // only the second left the card reading zero forever, and a Pearl engine
+                    // running at full tilt looked identical to one that had never started.
+                    s.hashrate = rate;
+                    s.gpu_hashrate = rate;
                 });
                 total_tiles = 0;
                 reported_at = std::time::Instant::now();

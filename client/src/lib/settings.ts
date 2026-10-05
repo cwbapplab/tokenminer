@@ -13,7 +13,6 @@ export interface QuantusSettings {
 
 export interface PearlSettings {
   certVersion: number;
-  threads: number;
 }
 
 export interface AppSettings {
@@ -44,8 +43,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
     metricsPort: 9900,
   },
   pearl: {
+    // The certificate version picks how the commitment roots are salted before the noise seeds
+    // are derived. It has to match what the pool sends in `mining.notify`; 1 and 2 are `Legacy`,
+    // 3 is `Salted`.
     certVersion: 2,
-    threads: 6,
   },
 };
 

@@ -57,6 +57,10 @@ pub mod pearl {
 }
 
 pub mod command;
+// Gated with the miner that uses it rather than left to compile on its own: the GPU backend, the
+// embedded cubins and the self-test kernels exist to serve Pearl and nothing else reaches them, so
+// a build without the feature would carry the lot as dead code.
+#[cfg(feature = "pearl")]
 pub mod gpu;
 
 /// Which mining backend.
@@ -140,7 +144,10 @@ impl EngineSlot {
     }
 
     fn snapshot(&self) -> MinerStatus {
-        self.status.lock().map(|s| s.clone()).unwrap_or_else(|_| MinerStatus::new(MinerKind::Pearl))
+        self.status
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| MinerStatus::new(MinerKind::Pearl))
     }
 
     fn is_active(&self) -> bool {
@@ -241,7 +248,12 @@ fn start_engine(
         s.updated_at = now();
     }
 
-    emit_log(app, kind, "info", format!("Starting {} engine…", kind.as_str()));
+    emit_log(
+        app,
+        kind,
+        "info",
+        format!("Starting {} engine…", kind.as_str()),
+    );
 
     let started = match kind {
         MinerKind::Quantus => quantus::start(app, config, status.clone()),
@@ -268,7 +280,12 @@ fn start_engine(
             slot.miner = started.miner;
             slot.poller = started.poller;
 
-            emit_log(app, kind, "info", format!("{} engine started.", kind.as_str()));
+            emit_log(
+                app,
+                kind,
+                "info",
+                format!("{} engine started.", kind.as_str()),
+            );
             emit_status(app, &snapshot);
             Ok(snapshot)
         }
@@ -278,7 +295,10 @@ fn start_engine(
                 s.message = Some(error.clone());
                 s.updated_at = now();
             }
-            let snapshot = status.lock().map(|s| s.clone()).unwrap_or_else(|_| MinerStatus::new(kind));
+            let snapshot = status
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_else(|_| MinerStatus::new(kind));
             emit_log(app, kind, "error", error.clone());
             emit_status(app, &snapshot);
             Err(error)
@@ -391,7 +411,10 @@ pub fn start_session_miner(
         MinerKind::Quantus => config.quantus,
         MinerKind::Pearl => config.pearl,
     };
-    if let Some(object) = engine_config.as_mut().and_then(|value| value.as_object_mut()) {
+    if let Some(object) = engine_config
+        .as_mut()
+        .and_then(|value| value.as_object_mut())
+    {
         if let Some(cpu) = params.cpu_workers {
             object.insert("cpuWorkers".into(), serde_json::json!(cpu));
         }
@@ -410,7 +433,12 @@ pub fn start_session_miner(
         }
     }
 
-    emit_log(&app, kind, "info", format!("Session command: {}", params.describe()));
+    emit_log(
+        &app,
+        kind,
+        "info",
+        format!("Session command: {}", params.describe()),
+    );
     // Also to the log file / Backend log so the raw command is easy to inspect.
     log::info!("session command from API: {}", config.command);
     if let Some(host) = &host {
@@ -430,7 +458,11 @@ pub fn start_session_miner(
 }
 
 #[tauri::command]
-pub fn stop_miner(app: AppHandle, state: State<'_, AppState>, kind: MinerKind) -> Result<MinerStatus, String> {
+pub fn stop_miner(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    kind: MinerKind,
+) -> Result<MinerStatus, String> {
     let mut manager = state.miners.lock().map_err(|_| "miner state is poisoned")?;
 
     match kind {
@@ -447,7 +479,10 @@ pub fn stop_miner(app: AppHandle, state: State<'_, AppState>, kind: MinerKind) -
     }
 
     let snapshot = {
-        let mut s = slot.status.lock().map_err(|_| "miner state is poisoned".to_string())?;
+        let mut s = slot
+            .status
+            .lock()
+            .map_err(|_| "miner state is poisoned".to_string())?;
         s.state = MinerState::Stopped;
         s.hashrate = 0.0;
         s.cpu_hashrate = 0.0;
@@ -459,7 +494,12 @@ pub fn stop_miner(app: AppHandle, state: State<'_, AppState>, kind: MinerKind) -
         s.clone()
     };
 
-    emit_log(&app, kind, "info", format!("{} engine stopped.", kind.as_str()));
+    emit_log(
+        &app,
+        kind,
+        "info",
+        format!("{} engine stopped.", kind.as_str()),
+    );
     emit_status(&app, &snapshot);
     Ok(snapshot)
 }

@@ -87,13 +87,11 @@ export function SettingsPage() {
               max={3}
               onChange={(value) => update("pearl", { ...settings.pearl, certVersion: value })}
             />
-            <NumberField
-              label="Proving threads"
-              value={settings.pearl.threads}
-              min={1}
-              max={64}
-              onChange={(value) => update("pearl", { ...settings.pearl, threads: value })}
-            />
+            {/* Read-only: the search runs entirely on the GPU, so there is no thread count to
+                choose. The dimensions are fixed at what the pools price shares against, and the
+                engine refuses anything else — shown here because a refused start names them. */}
+            <ReadOnlyField label="Matrix dimensions" value="131072 x 131072 x 4096, rank 256" />
+            <ReadOnlyField label="Hash tile" value="16 x 16" />
           </div>
         </Card>
 

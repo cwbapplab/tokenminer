@@ -7,7 +7,7 @@ import { Card, EmptyState, Spinner } from "../components/ui";
 import { MiniChart } from "../components/MiniChart";
 import { useMiners } from "../hooks/useMiners";
 import { getAnalytics } from "../lib/session";
-import { cn, formatHashrate, formatUsd } from "../lib/utils";
+import { cn, formatHashrate, formatPearlRate, formatUsd } from "../lib/utils";
 import type { MiningAnalytics } from "../lib/types";
 
 const SAMPLE_INTERVAL_MS = 2000;
@@ -53,17 +53,20 @@ export function DashboardPage() {
     return () => window.clearInterval(timer);
   }, []);
 
-  const total = miners.quantus.hashrate + miners.pearl.hashrate;
+  // Not the sum of the two engines, and deliberately. A Quantus hash and a Pearl tile are different
+  // quantities — the Pearl one is 16 x 16 x 4096 int8 MACs — so adding them produces a number with
+  // no unit behind it, and a "Total Hashrate" that jumps when you start the GPU engine rather than
+  // when you do more work. Each engine is reported in its own unit and the combined figure is
+  // labelled as being two engines rather than one rate.
   const activeMiners = [miners.quantus, miners.pearl].filter((m) => m.state === "running").length;
 
   const quantusSeries = samples.map((s) => s.quantus);
   const pearlSeries = samples.map((s) => s.pearl);
-  const totalSeries = samples.map((s) => s.quantus + s.pearl);
 
   const hashrateDelta = useMemo(() => {
     if (samples.length < 6) return null;
-    const past = samples[0].quantus + samples[0].pearl;
-    const now = samples[samples.length - 1].quantus + samples[samples.length - 1].pearl;
+    const past = samples[0].quantus;
+    const now = samples[samples.length - 1].quantus;
     if (past <= 0) return null;
     return ((now - past) / past) * 100;
   }, [samples]);
@@ -72,14 +75,42 @@ export function DashboardPage() {
   const previous30 = Math.max(0, totals.last60Usd - totals.last30Usd);
   const earningsDelta = previous30 > 0 ? ((totals.last30Usd - previous30) / previous30) * 100 : null;
 
-  const share = total > 0 ? (miners.quantus.hashrate / total) * 100 : 0;
+  // Which engines are running, not how the work divides between them: the two rates have no common
+  // unit to take a ratio of. Each engine's own rate is printed underneath in its own unit.
+  const share = activeMiners > 0 && miners.quantus.state === "running" ? 100 / activeMiners : 0;
+
+  // Each engine's tab plots its own rate on its own axis, in its own unit.
+//
+// The overview plots both, which cannot be on one scale: a Pearl rate is tens of millions of tiles
+// per second and a Quantus rate is orders of magnitude smaller, so a shared axis draws Quantus as a
+// flat line on the floor — a chart that looks like a stopped engine. Normalising each against its
+// own peak over the window shows both engines' shape (running, stalling, restarting) without
+// implying that the two numbers are comparable, and the exact rates are on the cards above.
+  const peak = (series: number[]) => series.reduce((max, v) => (v > max ? v : max), 0);
+  const relative = (series: number[]) => {
+    const top = peak(series);
+    return top > 0 ? series.map((v) => (v / top) * 100) : series.map(() => 0);
+  };
+
+  const overviewSeries = [
+    { name: "Quantus", data: relative(quantusSeries) },
+    { name: "Pearl", data: relative(pearlSeries) },
+  ];
 
   const chartSeries = {
-    overview: [{ name: "Hashrate", data: totalSeries }],
+    overview: overviewSeries,
     quantus: [{ name: "Quantus", data: quantusSeries }],
     pearl: [{ name: "Pearl", data: pearlSeries }],
   }[tab];
+  const chartIsRelative = tab === "overview";
+  const formatChartValue = chartIsRelative
+    ? (value: number) => `${Math.round(value)}%`
+    : tab === "quantus"
+      ? formatHashrate
+      : formatPearlRate;
 
+  // The y-axis and tooltip formatter follows the tab: a Pearl axis labelled in H/s is the same
+  // category error as summing the two engines, just drawn instead of printed.
   const chartOptions: ApexOptions = {
     chart: { toolbar: { show: false }, fontFamily: "inherit", foreColor: "#94a3b8" },
     colors: ["#4680ff"],
@@ -87,30 +118,30 @@ export function DashboardPage() {
     dataLabels: { enabled: false },
     grid: { borderColor: "rgba(148,163,184,0.18)", strokeDashArray: 4 },
     xaxis: { labels: { show: false }, axisBorder: { show: false }, axisTicks: { show: false } },
-    yaxis: { labels: { formatter: (value: number) => formatHashrate(value) } },
-    tooltip: { y: { formatter: (value: number) => formatHashrate(value) } },
+    yaxis: { labels: { formatter: formatChartValue } },
+    tooltip: { y: { formatter: formatChartValue } },
   };
 
   return (
     <div className="grid grid-cols-12 gap-4">
       <KpiCard
-        title="Total Hashrate"
-        value={formatHashrate(total)}
-        delta={hashrateDelta}
+        title="Both engines"
+        value={`${formatHashrate(miners.quantus.hashrate)} · ${formatPearlRate(miners.pearl.hashrate)}`}
+        delta={null}
         hint={`${activeMiners} of 2 engines online`}
-        chart={<MiniChart kind="bar" data={totalSeries} />}
+        chart={<MiniChart kind="bar" data={quantusSeries} />}
       />
       <KpiCard
         title="Quantus"
         value={formatHashrate(miners.quantus.hashrate)}
-        delta={null}
+        delta={hashrateDelta}
         hint={miners.quantus.state}
         accent="success"
         chart={<MiniChart kind="line" data={quantusSeries} />}
       />
       <KpiCard
         title="Pearl"
-        value={formatHashrate(miners.pearl.hashrate)}
+        value={formatPearlRate(miners.pearl.hashrate)}
         delta={null}
         hint={miners.pearl.state}
         accent="warning"
@@ -121,7 +152,7 @@ export function DashboardPage() {
       <div className="col-span-12 flex flex-col gap-4 md:col-span-6 xl:col-span-3">
         <div className="rounded-lg bg-gradient-to-br from-slate-800 to-slate-900 p-5 text-white shadow-sm">
           <div className="flex items-start justify-between">
-            <h5 className="text-sm font-semibold text-white">Hashrate Split</h5>
+            <h5 className="text-sm font-semibold text-white">Engine split</h5>
             <span className="text-sm font-semibold text-white">{Math.round(share)}%</span>
           </div>
           <div className="my-4">
@@ -130,7 +161,7 @@ export function DashboardPage() {
             </div>
           </div>
           <p className="text-xs text-white/80">
-            Quantus {formatHashrate(miners.quantus.hashrate)} · Pearl {formatHashrate(miners.pearl.hashrate)}
+            Quantus {formatHashrate(miners.quantus.hashrate)} · Pearl {formatPearlRate(miners.pearl.hashrate)}
           </p>
           <div className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-white/10">
             <div className="bg-brand-400" style={{ width: `${share}%` }} />
@@ -156,7 +187,7 @@ export function DashboardPage() {
             <div className="flex gap-6">
               {(
                 [
-                  ["overview", "Overview"],
+                  ["overview", "Both (relative)"],
                   ["quantus", "Quantus"],
                   ["pearl", "Pearl"],
                 ] as Array<[Tab, string]>
@@ -182,9 +213,15 @@ export function DashboardPage() {
             <div className="col-span-12 lg:col-span-8">
               <div className="mb-3 flex items-center gap-2">
                 <span className="rounded-md bg-brand-500 px-3 py-1 text-xs font-medium text-white">Live</span>
-                <span className="rounded-md border border-slate-200 px-3 py-1 text-xs text-slate-500 dark:border-slate-700">
-                  Last 60s
-                </span>
+                {chartIsRelative ? (
+                  <span className="rounded-md border border-slate-200 px-3 py-1 text-xs text-slate-500 dark:border-slate-700">
+                    % of each engine&apos;s own peak — the two rates have no common unit
+                  </span>
+                ) : (
+                  <span className="rounded-md border border-slate-200 px-3 py-1 text-xs text-slate-500 dark:border-slate-700">
+                    Last 60s
+                  </span>
+                )}
               </div>
               <Chart type="bar" height={280} series={chartSeries} options={chartOptions} />
             </div>
@@ -192,7 +229,8 @@ export function DashboardPage() {
             <div className="col-span-12 lg:col-span-4">
               <ul className="divide-y divide-slate-100 dark:divide-slate-800">
                 <StatRow icon={Cpu} label="CPU hashrate" value={formatHashrate(miners.quantus.cpuHashrate)} />
-                <StatRow icon={Zap} label="GPU hashrate" value={formatHashrate(miners.quantus.gpuHashrate)} />
+                <StatRow icon={Zap} label="Quantus GPU hashrate" value={formatHashrate(miners.quantus.gpuHashrate)} />
+                <StatRow icon={Pickaxe} label="Pearl tile rate" value={formatPearlRate(miners.pearl.gpuHashrate)} />
                 <StatRow icon={Pickaxe} label="Workers" value={String(miners.quantus.workers + miners.pearl.workers)} />
                 <StatRow icon={Gauge} label="Active jobs" value={String(miners.quantus.activeJobs)} />
               </ul>

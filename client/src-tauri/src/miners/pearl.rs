@@ -61,7 +61,10 @@ pub fn start(
             match backend.self_test() {
                 Ok(()) => log::info!("pearl: GPU {} usable — {described}", backend.name()),
                 Err(error) => {
-                    log::warn!("pearl: GPU {} failed its self-test: {error}", backend.name())
+                    log::warn!(
+                        "pearl: GPU {} failed its self-test: {error}",
+                        backend.name()
+                    )
                 }
             }
             backend.shutdown();

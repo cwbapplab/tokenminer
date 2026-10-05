@@ -32,10 +32,14 @@ pub fn parse_share_target(hex_target: &str) -> Result<U256, String> {
         return Err("The job's share target is empty.".into());
     }
     if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("The job's share target is not hexadecimal: '{trimmed}'"));
+        return Err(format!(
+            "The job's share target is not hexadecimal: '{trimmed}'"
+        ));
     }
     if digits.len() > 64 {
-        return Err(format!("The job's share target is wider than 256 bits: '{trimmed}'"));
+        return Err(format!(
+            "The job's share target is wider than 256 bits: '{trimmed}'"
+        ));
     }
 
     // `hex::decode` needs whole bytes.
@@ -112,7 +116,7 @@ pub fn target_to_nbits(target: U256) -> Result<u32, String> {
 
     // Bit length gives the exponent (how many bytes the full target needs).
     let bits = 256 - target.leading_zeros();
-    let mut exponent = (bits + 7) / 8;
+    let mut exponent = bits.div_ceil(8);
 
     let mut mantissa = if exponent <= 3 {
         let shift = 8 * (3 - exponent) as usize;
@@ -208,7 +212,10 @@ mod tests {
         // The pool sends 64 hex characters: 0x7fff8 followed by 46 zero digits.
         let hex = format!("{:0>64}", format!("7fff8{}", "0".repeat(46)));
         assert_eq!(hex.len(), 64);
-        assert!(hex.starts_with("0000000000000"), "left-padded, as the pool sends it");
+        assert!(
+            hex.starts_with("0000000000000"),
+            "left-padded, as the pool sends it"
+        );
 
         let parsed = parse_share_target(&hex).unwrap();
         assert_eq!(parsed, hero_target());
@@ -240,8 +247,15 @@ mod tests {
     fn re_encodes_a_share_target_as_the_documented_compact_nbits() {
         let nbits = target_to_nbits(hero_target()).unwrap();
 
-        assert_eq!(nbits, HERO_NBITS, "must match the compact value HeroMiners documents");
-        assert_eq!(nbits_to_difficulty(nbits), hero_target(), "exact round trip");
+        assert_eq!(
+            nbits, HERO_NBITS,
+            "must match the compact value HeroMiners documents"
+        );
+        assert_eq!(
+            nbits_to_difficulty(nbits),
+            hero_target(),
+            "exact round trip"
+        );
     }
 
     #[test]
@@ -274,7 +288,11 @@ mod tests {
         let mining = PearlMining::default();
         let config = mining_configuration(&mining).unwrap();
 
-        for target in [hero_target(), U256::from(1u8) << 200, U256::from(1u8) << 220] {
+        for target in [
+            hero_target(),
+            U256::from(1u8) << 200,
+            U256::from(1u8) << 220,
+        ] {
             let searched = share_bound(target, &mining).unwrap();
             let verified = extract_difficulty_bound(target_to_nbits(target).unwrap(), &config);
 
@@ -300,18 +318,21 @@ mod tests {
             searched / hero_target()
         );
 
-        // The gap is exactly `rank / PENALTY_BASE_RANK`. At the base rank the two agree, which is
-        // why the default configuration alone cannot demonstrate it.
-        let above = PearlMining {
-            rank: 256,
-            k: 4096,
-            ..PearlMining::default()
-        };
-        let penalised = penalized_target_bound(hero_target(), &mining_configuration(&above).unwrap())
-            .unwrap();
-        let searched = share_bound(hero_target(), &above).unwrap();
+        // The gap is exactly `rank / PENALTY_BASE_RANK`. The default configuration sits at
+        // rank 256, twice the base rank, so the two part company there and no separate
+        // configuration is needed to show it.
+        let penalised =
+            penalized_target_bound(hero_target(), &mining_configuration(&mining).unwrap()).unwrap();
 
-        assert_eq!(searched, penalised * (above.rank as usize / PENALTY_BASE_RANK));
+        assert_eq!(
+            searched,
+            penalised * (mining.rank as usize / PENALTY_BASE_RANK)
+        );
+        assert!(
+            searched > penalised,
+            "at rank {} the unpenalised bound should be the wider of the two",
+            mining.rank
+        );
     }
 
     #[test]
@@ -330,7 +351,12 @@ mod tests {
         //
         // A trivially easy `nbits` makes the verification bound saturate to U256::MAX, so the very
         // first tile is accepted and the test does not depend on luck.
-        let mining = PearlMining::default();
+        //
+        // The smallest configuration the verifier accepts, not the shipped default: the default is
+        // 131072 x 131072, and `try_mine_one` builds both matrices and a Merkle tree over each on
+        // the CPU, which turned this into a twelve-minute test. What is under test is the accept
+        // path, which does not read the dimensions.
+        let mining = crate::miners::pearl_mining::small_mining();
         let header = test_header(TRIVIAL_NBITS);
         let config = mining_configuration(&mining).unwrap();
 

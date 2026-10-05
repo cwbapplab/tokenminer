@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp \"C:/Users/Erick/Documents/dev/tokenminer/client/src-tauri/src/miners/gpu/kernels/pearl.cu\" \"C:/Users/Erick/Documents/dev/tokenminer/client/src-tauri/src/miners/gpu/kernels/blake3.cuh\" .)",
+      "Bash(sed -i 's#cd /tmp/pearlbench#cd \"C:/tmp/pearlbench\"#' build.sh)",
+      "Bash(nvidia-smi --query-gpu=name,utilization.gpu,clocks.sm,clocks.max.sm,memory.used,memory.total,power.draw,temperature.gpu,clocks_throttle_reasons.active --format=csv)",
+      "Bash(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv)",
+      "Bash(\"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4/bin/nvcc.exe\" -O3 -arch=sm_120a -ccbin 'C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostx64\\\\x64\\\\cl.exe' -Xptxas -v -cubin -o /dev/null bench.cu)",
+      "Bash(bash build.sh 1)",
+      "Bash(\"C:/Program Files/NVIDIA Corporation/Nsight Compute 2025.3/ncu-ui.exe\")",
+      "Bash(\"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4/bin/nvcc.exe\" -O3 -arch=sm_120a -ccbin 'C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostx64\\\\x64\\\\cl.exe' -lineinfo -o bench.exe bench.cu)",
+      "Bash(\"/c/Program Files/NVIDIA Corporation/Nsight Compute 2026.3.0/ncu.exe\" --target-processes all --launch-skip 1 --launch-count 1 --section SpeedOfLight --section MemoryWorkloadAnalysis --section LaunchStats --section Occupancy ./bench.exe 1 prod)",
+      "Bash(\"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4/bin/nvcc.exe\" -O3 -arch=sm_120a -ccbin 'C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostx64\\\\x64\\\\cl.exe' -Xptxas -v -o v2.exe v2.cu)",
+      "Bash(\"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4/bin/nvcc.exe\" -O3 -arch=sm_120a -ccbin 'C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostx64\\\\x64\\\\cl.exe' -Xptxas -v -cubin -o /dev/null v2.cu)",
+      "Bash(./v2.exe 2)",
+      "Bash(python -c *)",
+      "Bash(\"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4/bin/nvcc.exe\" -O3 -arch=sm_120a -ccbin 'C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostx64\\\\x64\\\\cl.exe' -o v2.exe v2.cu)",
+      "Bash(\"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4/bin/nvcc.exe\" -O3 -arch=sm_120a -ccbin 'C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostx64\\\\x64\\\\cl.exe' -o mmatest.exe mmatest.cu)",
+      "Bash(./mmatest.exe)",
+      "Bash(python -c ' *)",
+      "Bash(./v2.exe 1)"
+    ]
+  }
+}

@@ -4,7 +4,7 @@
 //! image it needs and never writes to disk or fetches anything at run time.
 //!
 //! A build machine without `nvcc` still produces the files — empty — so the crate keeps building.
-//! Presence therefore has to be checked, never assumed: see [`probe_cubin`].
+//! Presence therefore has to be checked, never assumed: see [`kernels_cubin`].
 
 /// A cubin compiled for one architecture.
 pub struct Cubin {
@@ -16,17 +16,20 @@ macro_rules! cubins {
     ($($arch:literal),* $(,)?) => {
         &[$(Cubin {
             arch: $arch,
-            bytes: include_bytes!(concat!(env!("OUT_DIR"), "/probe.", $arch, ".cubin")),
+            bytes: include_bytes!(concat!(env!("OUT_DIR"), "/kernels.", $arch, ".cubin")),
         }),*]
     };
 }
 
 /// Every architecture we embed an image for, in build order.
-pub static PROBE_CUBINS: &[Cubin] = cubins!("sm_75", "sm_86", "sm_89", "sm_90a", "sm_120a");
+///
+/// One cubin per architecture, carrying both the self-test probes and the mining kernels: the driver
+/// loads it as a single module, so they have to be in the same image.
+pub static KERNEL_CUBINS: &[Cubin] = cubins!("sm_75", "sm_86", "sm_89", "sm_90a", "sm_120a");
 
 /// The embedded image for `arch`, or `None` when that arch was not built.
-pub fn probe_cubin(arch: &str) -> Option<&'static [u8]> {
-    PROBE_CUBINS
+pub fn kernels_cubin(arch: &str) -> Option<&'static [u8]> {
+    KERNEL_CUBINS
         .iter()
         .find(|cubin| cubin.arch == arch)
         .map(|cubin| cubin.bytes)
@@ -35,7 +38,7 @@ pub fn probe_cubin(arch: &str) -> Option<&'static [u8]> {
 
 /// The architectures that actually have an image, for error messages and the UI.
 pub fn embedded_arches() -> Vec<&'static str> {
-    PROBE_CUBINS
+    KERNEL_CUBINS
         .iter()
         .filter(|cubin| !cubin.bytes.is_empty())
         .map(|cubin| cubin.arch)
@@ -44,5 +47,5 @@ pub fn embedded_arches() -> Vec<&'static str> {
 
 /// True when `nvcc` was available at build time.
 pub fn any_embedded() -> bool {
-    PROBE_CUBINS.iter().any(|cubin| !cubin.bytes.is_empty())
+    KERNEL_CUBINS.iter().any(|cubin| !cubin.bytes.is_empty())
 }

@@ -10,7 +10,11 @@ use tauri_plugin_log::{Target, TargetKind};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // `RUST_LOG=trace npm run tauri dev` for full verbosity; defaults to Info.
-    let level = match std::env::var("RUST_LOG").unwrap_or_default().to_ascii_lowercase().as_str() {
+    let level = match std::env::var("RUST_LOG")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "trace" => log::LevelFilter::Trace,
         "debug" => log::LevelFilter::Debug,
         "warn" => log::LevelFilter::Warn,

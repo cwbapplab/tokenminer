@@ -14,6 +14,11 @@ const ARCHES: &[&str] = &["sm_75", "sm_86", "sm_89", "sm_90a", "sm_120a"];
 /// Any missing piece of the toolchain writes the cubins empty instead of failing the build, so the
 /// crate keeps compiling on a machine without CUDA and the runtime reports "no embedded cubin"
 /// rather than the build breaking.
+///
+/// A toolchain that is *present* and still cannot compile the kernel is a different thing, and it
+/// fails the build: an `mma` instruction on an architecture that predates it, or a typo in a
+/// signature the launcher does not check, would otherwise embed five empty cubins and leave a build
+/// that looks fine and a miner that silently never starts. See [`build_arches`].
 fn build_cuda_kernels() {
     let out_dir = std::path::PathBuf::from(
         std::env::var("OUT_DIR").expect("cargo always sets OUT_DIR for build scripts"),
@@ -21,9 +26,16 @@ fn build_cuda_kernels() {
     let manifest = std::path::PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("cargo always sets CARGO_MANIFEST_DIR"),
     );
-    let kernel = manifest.join("src/miners/gpu/kernels/probe.cu");
+    // One translation unit, several sources: `kernels.cu` includes the rest, because a cubin is a
+    // single module and every entry point has to live in the one image.
+    let kernels = manifest.join("src/miners/gpu/kernels");
+    let kernel = kernels.join("kernels.cu");
 
-    println!("cargo:rerun-if-changed={}", kernel.display());
+    // Listed one by one rather than watching the directory, so a missing or renamed source is
+    // visible here instead of silently producing a stale cubin.
+    for source in ["kernels.cu", "blake3.cuh", "probe.cu", "pearl.cu"] {
+        println!("cargo:rerun-if-changed={}", kernels.join(source).display());
+    }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
@@ -48,34 +60,75 @@ fn build_cuda_kernels() {
         return;
     }
 
-    for arch in ARCHES {
-        let out = out_dir.join(format!("probe.{arch}.cubin"));
+    build_arches(&nvcc, host_compiler.as_deref(), &kernel, &out_dir);
+}
 
-        let mut command = std::process::Command::new(&nvcc);
+/// Compiles one cubin per architecture, and refuses to succeed if none of them compiled.
+///
+/// Losing *some* architectures is a real configuration -- a toolkit older than the newest card in
+/// `ARCHES` simply cannot target it, and that card is not the one the developer is holding -- so a
+/// partial failure is a warning and an empty cubin for the architectures that did not build. Losing
+/// *all* of them has no such innocent reading: the toolchain ran and rejected the source, and the
+/// resulting image is indistinguishable at runtime from a client with no GPU in it.
+///
+/// So that case panics. The cost of being wrong in the other direction is a broken build on a
+/// machine that never had a GPU in it, and that machine is already covered above: no nvcc, or no
+/// `cl.exe`, returns before this point and writes empty cubins without complaining.
+fn build_arches(
+    nvcc: &std::path::Path,
+    host_compiler: Option<&std::path::Path>,
+    kernel: &std::path::Path,
+    out_dir: &std::path::Path,
+) {
+    let mut built = Vec::new();
+    let mut failed = Vec::new();
+
+    for arch in ARCHES {
+        let out = out_dir.join(format!("kernels.{arch}.cubin"));
+
+        let mut command = std::process::Command::new(nvcc);
         command.arg("-cubin").arg(format!("-arch={arch}"));
-        if let Some(host_compiler) = &host_compiler {
+        if let Some(host_compiler) = host_compiler {
             command.arg("-ccbin").arg(host_compiler);
         }
 
-        match command.arg("-o").arg(&out).arg(&kernel).status() {
-            Ok(status) if status.success() => {}
+        match command.arg("-o").arg(&out).arg(kernel).status() {
+            Ok(status) if status.success() => built.push(*arch),
             Ok(status) => {
                 println!(
                     "cargo:warning=nvcc failed for {arch} (exit {status}); no cubin embedded for it"
                 );
                 let _ = std::fs::write(&out, []);
+                failed.push(*arch);
             }
             Err(error) => {
                 println!("cargo:warning=could not run nvcc for {arch}: {error}");
                 let _ = std::fs::write(&out, []);
+                failed.push(*arch);
             }
         }
+    }
+
+    if built.is_empty() {
+        panic!(
+            "nvcc compiled the kernel for none of {ARCHES:?} (all failed: {failed:?}), so the \
+             client would build with no GPU support at all. The compiler's diagnostics are above. \
+             If this machine genuinely has no CUDA toolkit, remove it from PATH and unset \
+             CUDA_PATH instead -- a toolchain that is absent is handled without failing the build."
+        );
+    }
+
+    if !failed.is_empty() {
+        println!(
+            "cargo:warning=embedded cubins for {built:?} only; {failed:?} did not compile, so the \
+             client will not mine on those GPUs."
+        );
     }
 }
 
 fn write_empty_cubins(out_dir: &std::path::Path) {
     for arch in ARCHES {
-        let _ = std::fs::write(out_dir.join(format!("probe.{arch}.cubin")), []);
+        let _ = std::fs::write(out_dir.join(format!("kernels.{arch}.cubin")), []);
     }
 }
 
@@ -89,7 +142,11 @@ fn find_nvcc() -> Option<std::path::PathBuf> {
     }
 
     // `output()` fails when the program cannot be spawned, which is the check we want.
-    if std::process::Command::new("nvcc").arg("--version").output().is_ok() {
+    if std::process::Command::new("nvcc")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
         return Some(std::path::PathBuf::from("nvcc"));
     }
 

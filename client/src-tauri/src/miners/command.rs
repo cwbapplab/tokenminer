@@ -199,7 +199,18 @@ pub fn parse(command: &str) -> Result<MinerParams, String> {
     let algo = find(&flags, &["algo", "-a"]).map(str::to_string);
     let mut host = find(
         &flags,
-        &["stratum", "stratum-url", "stratumurl", "pool", "pool-url", "poolurl", "url", "host", "-o", "server"],
+        &[
+            "stratum",
+            "stratum-url",
+            "stratumurl",
+            "pool",
+            "pool-url",
+            "poolurl",
+            "url",
+            "host",
+            "-o",
+            "server",
+        ],
     )
     .map(normalize_host);
 
@@ -211,8 +222,13 @@ pub fn parse(command: &str) -> Result<MinerParams, String> {
             .map(|token| normalize_host(token));
     }
 
-    let mut wallet = find(&flags, &["wallet", "user", "--user", "-u", "address"]).map(str::to_string);
-    let mut worker = find(&flags, &["worker-name", "workername", "worker", "-w", "rig"]).map(str::to_string);
+    let mut wallet =
+        find(&flags, &["wallet", "user", "--user", "-u", "address"]).map(str::to_string);
+    let mut worker = find(
+        &flags,
+        &["worker-name", "workername", "worker", "-w", "rig"],
+    )
+    .map(str::to_string);
 
     // `-u wallet.worker` is the common CPUMiner-style combined form.
     if worker.is_none() {
@@ -238,7 +254,11 @@ pub fn parse(command: &str) -> Result<MinerParams, String> {
 
 /// Chooses the embedded engine for a session from the coin/algorithm, falling back
 /// to the program name (e.g. `...pearl...` → Pearl).
-pub fn resolve_kind(coin_code: Option<&str>, algorithm_code: Option<&str>, program: &str) -> MinerKind {
+pub fn resolve_kind(
+    coin_code: Option<&str>,
+    algorithm_code: Option<&str>,
+    program: &str,
+) -> MinerKind {
     let haystack = format!(
         "{} {} {}",
         coin_code.unwrap_or_default(),
@@ -290,7 +310,10 @@ mod tests {
     #[test]
     fn resolves_kind_from_coin_and_program() {
         assert_eq!(resolve_kind(Some("PRL"), None, "miner"), MinerKind::Pearl);
-        assert_eq!(resolve_kind(None, Some("quantus"), "miner"), MinerKind::Quantus);
+        assert_eq!(
+            resolve_kind(None, Some("quantus"), "miner"),
+            MinerKind::Quantus
+        );
         assert_eq!(resolve_kind(None, None, "pearl-miner"), MinerKind::Pearl);
     }
 

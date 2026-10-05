@@ -59,15 +59,20 @@ pub fn start(
     status: Arc<Mutex<MinerStatus>>,
 ) -> Result<Started, String> {
     let config: QuantusConfig = match config {
-        Some(value) => serde_json::from_value(value).map_err(|e| format!("Invalid Quantus config: {e}"))?,
-        None => return Err("Quantus requires a node address, auth token file and TLS pin file.".into()),
+        Some(value) => {
+            serde_json::from_value(value).map_err(|e| format!("Invalid Quantus config: {e}"))?
+        }
+        None => {
+            return Err("Quantus requires a node address, auth token file and TLS pin file.".into())
+        }
     };
 
     let auth_token = read_trimmed(&config.auth_token_file)?;
     let tls_cert_sha256 = read_trimmed(&config.tls_cert_sha256_file)?;
 
     // Fail closed on a malformed pin/token before spawning any workers.
-    quic_transport::validate_auth_config(&auth_token, &tls_cert_sha256).map_err(|e| e.to_string())?;
+    quic_transport::validate_auth_config(&auth_token, &tls_cert_sha256)
+        .map_err(|e| e.to_string())?;
 
     let node_addr: SocketAddr = config
         .node_addr
@@ -84,7 +89,11 @@ pub fn start(
         });
     }
 
-    let gpu_batch_size = if config.cuda_gpu { CUDA_GPU_BATCH } else { DEFAULT_GPU_BATCH };
+    let gpu_batch_size = if config.cuda_gpu {
+        CUDA_GPU_BATCH
+    } else {
+        DEFAULT_GPU_BATCH
+    };
     let service = miner_service::ServiceConfig {
         node_addr,
         auth_token,
@@ -103,7 +112,12 @@ pub fn start(
     let miner = tauri::async_runtime::spawn(async move {
         if let Err(error) = miner_service::run(service).await {
             log::error!("quantus miner stopped: {error}");
-            emit_log(&miner_app, MinerKind::Quantus, "error", format!("Miner stopped: {error}"));
+            emit_log(
+                &miner_app,
+                MinerKind::Quantus,
+                "error",
+                format!("Miner stopped: {error}"),
+            );
             if let Ok(mut s) = miner_status.lock() {
                 s.state = MinerState::Error;
                 s.message = Some(error.to_string());
@@ -134,7 +148,10 @@ pub fn stop(_app: &AppHandle) {
 
 /// Polls `GET /metrics` and mirrors the gauges into the shared status.
 async fn poll_metrics(app: AppHandle, port: u16, status: Arc<Mutex<MinerStatus>>) {
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(3)).build() {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
         Ok(client) => client,
         Err(error) => {
             log::error!("failed to build metrics client: {error}");
@@ -186,8 +203,12 @@ fn parse_prometheus(body: &str) -> HashMap<String, f64> {
         }
 
         let mut parts = line.split_whitespace();
-        let Some(raw_name) = parts.next() else { continue };
-        let Some(raw_value) = parts.next() else { continue };
+        let Some(raw_name) = parts.next() else {
+            continue;
+        };
+        let Some(raw_value) = parts.next() else {
+            continue;
+        };
 
         // Drop any label set, e.g. `miner_hash_rate{engine="cpu"}`.
         let name = raw_name.split('{').next().unwrap_or(raw_name);

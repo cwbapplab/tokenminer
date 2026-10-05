@@ -10,6 +10,8 @@
 
 #include <mma.h>
 
+#include "blake3.cuh"
+
 // Stamps the architecture this image was compiled for, so the host can confirm which cubin the
 // driver actually loaded, plus a thread index so the launch geometry can be sanity-checked.
 extern "C" __global__ void tokenminer_arch_probe(unsigned int* out) {
@@ -79,10 +81,13 @@ extern "C" __global__ void tokenminer_i8_gemm(
 // The Pearl jackpot for one tile pair, matching `zk_pow::circuit::chip::compute_jackpot` exactly.
 //
 // `secret_a` is h x k and `secret_b` is w x k, both row-major i8, with `noise_a` / `noise_b` shaped
-// to match. The operands are *summed before multiplying*, so each factor is in [-128, 128] and
-// cannot be fed to INT8 tensor cores directly — the host has to expand
-// (a + na)(b + nb) = ab + a*nb + na*b + na*nb into four INT8 products. (That expansion is the next
-// step; this kernel is the plain-loop version that pins the semantics down.)
+// to match. Consensus multiplies the operands *summed*, so this expands
+// (a + na)(b + nb) = ab + a*nb + na*b + na*nb into four INT8 products rather than summing first.
+//
+// That expansion is deliberate and superseded: the sums are in [-127, 126] and do fit an INT8
+// operand, so `tokenminer_jackpot_fold` below gets there in one GEMM. This kernel stays for tile
+// shapes `wmma` cannot hold — any h or w that is not a multiple of 16 — and because it is the
+// literal expansion of the reference expression, it pins the semantics the fast kernel has to match.
 //
 // One block handles one tile pair. The cell sums live in shared memory because they *carry across*
 // rank blocks: the canonical fold XORs the running totals after each block, not per-block sums.
@@ -168,98 +173,87 @@ extern "C" __global__ void tokenminer_jackpot(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Keyed BLAKE3 over the jackpot message.
-// ---------------------------------------------------------------------------
+// The summed-operand fold: one INT8 tensor-core GEMM over `a_sum` and `b_sum`, folded into the
+// sixteen-word transcript `compute_jackpot` returns.
+//
+// This is the operation the whole miner exists to run, and it is one GEMM rather than four because
+// consensus multiplies the *sums*. `signal` is in [-64, 63] and the noise is a difference of two
+// entries of a [-32, 31] dense row, so `signal + noise` is in [-127, 126] and still fits in an
+// INT8 tensor-core operand. `tokenminer_jackpot` above does the same job the long way round, with
+// the four-term expansion, and both are held against `compute_jackpot`; this one is the one the
+// search will use, and the other covers tile shapes whose h or w is not a whole 16.
+//
+// `h` and `w` must both be multiples of 16, the shape `wmma` can hold in one fragment pair. The
+// reference miner's production tile is 16x16 (`HT = 16` in `luckypool_miner.py`), but the pattern
+// arrives in the job, so this is a dispatch decision and not an assumption.
+//
+// B is read as `col_major` against a `k`-strided pointer: the fragment wants element (l, v) at
+// `ptr[l + v * ldm]`, and `b_sum[v * k + l]` is exactly that. Loading it `row_major` — as
+// `tokenminer_i8_gemm` does, because that kernel takes a genuine K x N matrix — would transpose the
+// tile and quietly hash a different one.
+extern "C" __global__ void tokenminer_jackpot_fold(
+    const signed char* a_sum,          // h x k, row-major
+    const signed char* b_sum,          // w x k, row-major
+    unsigned int* jackpot,             // JACKPOT_WORDS words, zeroed on entry
+    int k,
+    int rank,
+    int h,
+    int w) {
+    using namespace nvcuda;
 
-__device__ __constant__ unsigned int B3_IV[4] = {
-    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
-};
+    __shared__ int cells[16 * 16];
+    __shared__ unsigned int partials[32];
 
-__device__ __constant__ unsigned char B3_SCHEDULE[7][16] = {
-    { 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15},
-    { 2,  6,  3, 10,  7,  0,  4, 13,  1, 11, 12,  5,  9, 14, 15,  8},
-    { 3,  4, 10, 12, 13,  2,  7, 14,  6,  5,  9,  0, 11, 15,  8,  1},
-    {10,  7, 12,  9, 14,  3, 13, 15,  4,  0, 11,  2,  5,  8,  1,  6},
-    {12, 13,  9, 11, 15, 10, 14,  8,  7,  2,  5,  3,  0,  1,  6,  4},
-    { 9, 14, 11,  5,  8, 12, 15,  1, 13,  3,  0, 10,  2,  6,  4,  7},
-    {11, 15,  5,  0,  1,  9,  8,  6, 14, 10,  2, 12,  3,  4,  7, 13},
-};
+    const int tid = threadIdx.x;
+    const int rank_blocks = k / rank;
 
-#define B3_ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+    // Never reset between rank blocks: the transcript folds the running totals, so resetting here
+    // would leave the first word right and every later word wrong.
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc;
+    wmma::fill_fragment(acc, 0);
 
-#define B3_G(a, b, c, d, mx, my)        \
-    do {                                 \
-        v[a] = v[a] + v[b] + (mx);       \
-        v[d] = B3_ROTR(v[d] ^ v[a], 16); \
-        v[c] = v[c] + v[d];              \
-        v[b] = B3_ROTR(v[b] ^ v[c], 12); \
-        v[a] = v[a] + v[b] + (my);       \
-        v[d] = B3_ROTR(v[d] ^ v[a], 8);  \
-        v[c] = v[c] + v[d];              \
-        v[b] = B3_ROTR(v[b] ^ v[c], 7);  \
-    } while (0)
+    for (int block = 0; block < rank_blocks; ++block) {
+        const int lo = block * rank;
+        const int hi = lo + rank;
 
-#define B3_ROUND(r)                                                                  \
-    do {                                                                             \
-        B3_G(0, 4,  8, 12, block[B3_SCHEDULE[r][ 0]], block[B3_SCHEDULE[r][ 1]]);     \
-        B3_G(1, 5,  9, 13, block[B3_SCHEDULE[r][ 2]], block[B3_SCHEDULE[r][ 3]]);     \
-        B3_G(2, 6, 10, 14, block[B3_SCHEDULE[r][ 4]], block[B3_SCHEDULE[r][ 5]]);     \
-        B3_G(3, 7, 11, 15, block[B3_SCHEDULE[r][ 6]], block[B3_SCHEDULE[r][ 7]]);     \
-        B3_G(0, 5, 10, 15, block[B3_SCHEDULE[r][ 8]], block[B3_SCHEDULE[r][ 9]]);     \
-        B3_G(1, 6, 11, 12, block[B3_SCHEDULE[r][10]], block[B3_SCHEDULE[r][11]]);     \
-        B3_G(2, 7,  8, 13, block[B3_SCHEDULE[r][12]], block[B3_SCHEDULE[r][13]]);     \
-        B3_G(3, 4,  9, 14, block[B3_SCHEDULE[r][14]], block[B3_SCHEDULE[r][15]]);     \
-    } while (0)
+        for (int kk = lo; kk < hi; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> b_frag;
+            wmma::load_matrix_sync(a_frag, a_sum + kk, k);
+            wmma::load_matrix_sync(b_frag, b_sum + kk, k);
+            wmma::mma_sync(acc, a_frag, b_frag, acc);
+        }
 
-// Keyed BLAKE3 of a 64-byte message: exactly one chunk, so exactly one compression with the ROOT
-// flag. Mirrors `pearl_blake3::blake3_digest(message, Some(key))`, which is what
-// `compute_jackpot_hash` applies to the sixteen little-endian jackpot words.
-extern "C" __global__ void tokenminer_jackpot_hash(
-    const unsigned char* message,
-    const unsigned char* key,
-    unsigned char* digest) {
-    unsigned int block[16];
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        block[i] = (unsigned int)message[i * 4]
-                 | ((unsigned int)message[i * 4 + 1] << 8)
-                 | ((unsigned int)message[i * 4 + 2] << 16)
-                 | ((unsigned int)message[i * 4 + 3] << 24);
-    }
+        // The fragment layout is the compiler's problem, but reading arbitrary cells back out of it
+        // is not, so it goes through shared memory once per rank block rather than once per element.
+        __syncthreads();
+        wmma::store_matrix_sync(cells, acc, 16, wmma::mem_row_major);
+        __syncthreads();
 
-    unsigned int v[16];
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        v[i] = (unsigned int)key[i * 4]
-             | ((unsigned int)key[i * 4 + 1] << 8)
-             | ((unsigned int)key[i * 4 + 2] << 16)
-             | ((unsigned int)key[i * 4 + 3] << 24);
-    }
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        v[8 + i] = B3_IV[i];
-    }
-    v[12] = 0;   // chunk counter low: the whole message is one chunk
-    v[13] = 0;   // chunk counter high
-    v[14] = 64;  // block length
-    v[15] = 27;  // CHUNK_START | CHUNK_END | ROOT | KEYED_HASH
+        unsigned int partial = 0;
+        for (int i = tid; i < 16 * 16; i += blockDim.x) {
+            partial ^= (unsigned int)cells[i];
+        }
 
-    B3_ROUND(0);
-    B3_ROUND(1);
-    B3_ROUND(2);
-    B3_ROUND(3);
-    B3_ROUND(4);
-    B3_ROUND(5);
-    B3_ROUND(6);
+        partials[tid] = partial;
+        __syncthreads();
 
-    // A 32-byte root output is the first eight words folded with the last eight.
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const unsigned int word = v[i] ^ v[i + 8];
-        digest[i * 4]     = (unsigned char)(word);
-        digest[i * 4 + 1] = (unsigned char)(word >> 8);
-        digest[i * 4 + 2] = (unsigned char)(word >> 16);
-        digest[i * 4 + 3] = (unsigned char)(word >> 24);
+        for (int span = blockDim.x / 2; span > 0; span >>= 1) {
+            if (tid < span) {
+                partials[tid] ^= partials[tid + span];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            const unsigned int slot = (unsigned int)(block % JACKPOT_WORDS);
+            const unsigned int rotated = (jackpot[slot] << LROT_PER_TILE)
+                                       | (jackpot[slot] >> (32 - LROT_PER_TILE));
+            jackpot[slot] = rotated ^ partials[0];
+        }
     }
 }
+
+// Keyed BLAKE3 over the jackpot message has no kernel of its own: a 64-byte message is exactly one
+// chunk, so it is `tokenminer_blake3_root_chunk` in `pearl.cu`. One implementation, and a bug in it
+// fails the jackpot check and the tree check together rather than hiding behind a second copy.
