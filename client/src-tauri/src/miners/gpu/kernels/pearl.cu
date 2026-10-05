@@ -356,8 +356,32 @@ extern "C" __global__ void tokenminer_fill_i8(
 // the profiler puts shared memory at one block as well as registers. A stride of 32 would need an
 // XOR swizzle to keep the fragment loads off the same banks; at 64 that swizzle is not optional,
 // because an unpadded 64 is `0 (mod 32)` and every `ldmatrix` would cost four times what it should.
+// Overridable so the benchmark harness can A/B a geometry without editing this file. The shipped
+// values are the defaults; nothing sets these in the real build.
+#ifndef POW_BLOCK_ROWS
 #define POW_BLOCK_ROWS 16
-#define POW_BLOCK_COLS 8
+#endif
+#ifndef POW_BLOCK_COLS
+#define POW_BLOCK_COLS 12
+#endif
+#ifndef POW_STAGES
+#define POW_STAGES 2
+#endif
+// Row strips walked before advancing the column strip. 1 is the identity (linear block order).
+#ifndef POW_L2_GROUP
+#define POW_L2_GROUP 1
+#endif
+// 1 = `cp.async.cg` (bypass L1, the default), 0 = `cp.async.ca` (cache in L1). Measured, not assumed.
+#ifndef POW_CP_ASYNC_CA
+#define POW_CP_ASYNC_CA 0
+#endif
+// 1 = put the transcript buffer in the dynamic shared allocation rather than `static __shared__`.
+// See the declaration in `tokenminer_search_grid`. On by default: it measures 138.4 against 137.5
+// for the static form at the shipped 16x12, and it makes the block's whole shared-memory footprint
+// one number the launch requests instead of two the reader has to add.
+#ifndef POW_SMEM_T_DYNAMIC
+#define POW_SMEM_T_DYNAMIC 1
+#endif
 #define POW_WARPS POW_BLOCK_ROWS
 #define POW_THREADS (POW_WARPS * 32)
 #define POW_TILES_PER_BLOCK (POW_BLOCK_ROWS * POW_BLOCK_COLS)
@@ -451,9 +475,9 @@ extern __shared__ __align__(16) signed char pow_dynamic_smem[];
 // knowing because 64 is the width a stage wants most, and it is why the pad is there.
 #define POW_SMEM_STRIDE (POW_BK + 16)
 
-// Stages in flight. Two is the fewest that overlap the next k-step's copy with the current one's
-// multiply, and a barrier is needed between them either way.
-#define POW_STAGES 2
+// Stages in flight, defined with the rest of the geometry above so a benchmark can override it.
+// Two is the fewest that overlap the next k-step's copy with the current one's multiply, and a
+// barrier is needed between them either way.
 
 // Bytes of shared memory a block's three buffers take, laid out contiguously in the dynamic
 // allocation: A, then B, then the transcript. `POW_SMEM_STRIDE` pads each staged row, so these
@@ -605,10 +629,25 @@ __device__ __forceinline__ void pow_stage_copy(signed char* smem,
     signed char* dst = smem + row * POW_SMEM_STRIDE + offset;
     const signed char* from = src + (long long)row * ldm + kk + offset;
 #if __CUDA_ARCH__ >= 800
-    // `.cg` bypasses L1: the staged bytes are read once by one block and never reused by another, so
-    // caching them only evicts something that would have been.
+    // `POW_CP_ASYNC_CA` selects the L1-caching form of `cp.async`.
+    //
+    // `.cg` (the default) bypasses L1 and caches only in L2. `.ca` also caches in L1. Which is right
+    // depends entirely on whether two blocks on this SM read the same bytes, and the original
+    // comment here asserted they never do — "the staged bytes are read once by one block and never
+    // reused by another". That is false. A 16x8 block reads 16 rows of A, and the grid has
+    // `tiles_per_row / 8` = 1024 column strips per row strip, so ~1024 blocks read those same 16 rows
+    // of A. With 84 SMs and linear block order those blocks are spread far apart in time, which is
+    // why the measured effect of this switch was small -- but the reuse is real and is what the
+    // bandwidth arithmetic in `POW_BLOCK_ROWS` is about.
+    //
+    // Overridable so the choice can be measured rather than assumed.
+#if POW_CP_ASYNC_CA
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(
+                     (unsigned int)__cvta_generic_to_shared(dst)), "l"(from));
+#else
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(
                      (unsigned int)__cvta_generic_to_shared(dst)), "l"(from));
+#endif
 #else
     *(uint4*)dst = *(const uint4*)from;
 #endif
@@ -667,7 +706,20 @@ __device__ __forceinline__ void pow_stage_copy(signed char* smem,
 // fails every launch with `cudaErrorLaunchOutOfResources`. Capping at one block's worth of registers
 // makes ptxas spill the excess instead, which costs the fallback path speed and is the right trade for
 // a card that has no tensor cores to begin with. The `mma` paths sit at 94 to 128 and are untouched.
-extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid(
+//
+// The cap is the *tensor* path's, and it is the binding constraint on the block rectangle rather than
+// a formality. The accumulator alone is `POW_BLOCK_COLS * 2 * 4` registers per lane, so a rectangle
+// of N columns asks for 8N of them before anything else. At N = 16 that is 128, and ptxas responds by
+// spilling: measured with `-Xptxas -v`, `POW_BLOCK_COLS` 12 spills 16 bytes (negligible) while 16
+// spills 1600 stores / 1808 loads and the kernel falls off a cliff to 17 TH/s against 138 for 12
+// columns. That collapse is a register spill, not shared memory and not traffic — 16x16 fits in the
+// 101,376 B shared-memory budget either way.
+//
+// Overridable so the cap can be swept rather than assumed.
+#ifndef POW_MIN_BLOCKS
+#define POW_MIN_BLOCKS 1
+#endif
+extern "C" __global__ __launch_bounds__(POW_THREADS, POW_MIN_BLOCKS) void tokenminer_search_grid(
         const signed char* a_sum,          // m_tiles * 16 rows of k, row-major
         const signed char* b_sum,          // n_tiles * 16 rows of k, row-major
         const unsigned int* key_words,     // eight words: dnsA
@@ -687,7 +739,28 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
     // it fits the static cap on its own, and leaving it static keeps it out of the launch's
     // `shared_mem_bytes`.
     signed char* const smem = pow_dynamic_smem;
+
+    // The transcript buffer, addressed as one flat array of `POW_WARPS * POW_BLOCK_COLS *
+    // POW_TRANSCRIPT_WORDS` words under `POW_SMEM_T_DYNAMIC`, and as a `[warp][col][word]` array
+    // otherwise. Both are the same bytes in the same order; only the indexing syntax differs, so
+    // every use goes through `pow_sT_AT` below and never indexes `sT` directly.
+    //
+    // `POW_SMEM_T_DYNAMIC` exists for one reason: it is what stands between the shipped geometry and
+    // a wider rectangle. At `POW_BLOCK_COLS` 16 the static form is 16 KB on top of 80 KB of staging,
+    // which is 96 KB against a 101,376 B opt-in limit -- it fits, but it leaves the SM unable to hold
+    // a second block, and 16x16 measured 17 TH/s against 138 for 16x12. Moving it to the dynamic
+    // allocation does not change the total (the driver draws both from the same budget); it makes
+    // the whole footprint one number the launch requests and one number the host can check.
+    //
+    // Off by default. The geometry that ships does not need it, and the layout change is not one to
+    // make for its own sake.
+#if POW_SMEM_T_DYNAMIC
+    unsigned int* const sT = reinterpret_cast<unsigned int*>(smem + POW_SMEM_DYNAMIC_BYTES);
+#define POW_ST_AT(w, c, d) sT[((w) * POW_BLOCK_COLS + (c)) * POW_TRANSCRIPT_WORDS + (d)]
+#else
     __shared__ unsigned int sT[POW_WARPS][POW_BLOCK_COLS][POW_TRANSCRIPT_WORDS];
+#define POW_ST_AT(w, c, d) sT[(w)][(c)][(d)]
+#endif
 
     // Typed views of the staged operands, so the rest of the kernel keeps indexing them as
     // `[stage][row * POW_SMEM_STRIDE]` and cannot drift out of step with the allocation above.
@@ -723,8 +796,40 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
     const unsigned int first_row = first_tile / tiles_per_row;
     const unsigned int rows_in_batch = tiles / tiles_per_row;
     const unsigned int cols_per_strip = (tiles_per_row + POW_BLOCK_COLS - 1) / POW_BLOCK_COLS;
-    const unsigned int strip = blockIdx.x / cols_per_strip;
-    const unsigned int col_block = blockIdx.x - strip * cols_per_strip;
+
+    // Block -> rectangle mapping, with an optional L2-locality swizzle.
+    //
+    // Linear order gives each block a 16x8 rectangle whose row is `strip` and whose column strip is
+    // `blockIdx.x % cols_per_strip`. Consecutive block IDs therefore walk *columns* while holding the
+    // same rows, so the blocks resident at any instant read 16 rows of A (64 KiB, which fits L2
+    // easily) but stride across all of B (512 MiB). Every one of those B reads misses L2.
+    //
+    // A "grouped" schedule -- walk a group of G row-strips before advancing the column -- makes the
+    // concurrently-resident blocks span a square-ish patch of the tile grid instead of a line, so
+    // both operands are shared and both fit in the 64 MB L2. This is the same swizzle CUTLASS and
+    // Triton apply to GEMM tile schedules; here it is the difference between sharing one operand and
+    // sharing both.
+    //
+    // `POW_L2_GROUP` of 1 is the identity (linear order) and is what an unset build gets. The group
+    // count is in strips, not blocks, so a group of G covers G*POW_BLOCK_ROWS tile rows.
+    unsigned int strip, col_block;
+#if POW_L2_GROUP > 1
+    const unsigned int strips_in_batch = rows_in_batch / POW_BLOCK_ROWS;   // full row strips
+    const unsigned int groups_per_batch = (strips_in_batch + POW_L2_GROUP - 1) / POW_L2_GROUP;
+    if (groups_per_batch > 0) {
+        const unsigned int group = blockIdx.x / (POW_L2_GROUP * cols_per_strip);
+        const unsigned int within = blockIdx.x - group * (POW_L2_GROUP * cols_per_strip);
+        const unsigned int g_strip = within / cols_per_strip;
+        col_block = within - g_strip * cols_per_strip;
+        strip = group * POW_L2_GROUP + g_strip;
+    } else {
+        strip = blockIdx.x / cols_per_strip;
+        col_block = blockIdx.x - strip * cols_per_strip;
+    }
+#else
+    strip = blockIdx.x / cols_per_strip;
+    col_block = blockIdx.x - strip * cols_per_strip;
+#endif
 
     const unsigned int row0 = first_row + strip * POW_BLOCK_ROWS;
     const unsigned int col0 = col_block * POW_BLOCK_COLS;
@@ -763,6 +868,10 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
     // worst failure mode this file has. `tokenminer_jackpot_fold` gets this from a zeroed device
     // allocation instead, since it has no shared transcript of its own.
     //
+    // This loop is what makes `POW_SMEM_T_DYNAMIC` safe: a `static __shared__` array is zeroed by the
+    // driver, but a slice of the dynamic allocation is not, so with the transcript buffer moved there
+    // this loop is the only thing standing between a launch and an uninitialised transcript.
+    //
     // The barrier is load-bearing rather than tidy. The zeroing is spread over every thread, so each
     // warp clears slices other warps own; without the barrier a warp that has already folded its own
     // slice has it zeroed underneath by one still in the loop, and every transcript comes back empty.
@@ -770,7 +879,7 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
         const int w = i / (POW_BLOCK_COLS * POW_TRANSCRIPT_WORDS);
         const int rest = i - w * POW_BLOCK_COLS * POW_TRANSCRIPT_WORDS;
         const int t = rest / POW_TRANSCRIPT_WORDS;
-        sT[w][t][rest - t * POW_TRANSCRIPT_WORDS] = 0u;
+        POW_ST_AT(w, t, rest - t * POW_TRANSCRIPT_WORDS) = 0u;
     }
     __syncthreads();
 
@@ -818,7 +927,13 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
     }
 
     for (int step = 0; step < total_steps; ++step) {
-        pow_cp_async_wait<POW_STAGES - 2>();
+        // `cp.async.wait_group` takes an immediate count of groups still allowed to be in flight.
+        // With S stages the newest commit is for the *next* step, so S-1 may remain outstanding and
+        // the wait is for `S - 2`. At S == 2 that is 0 -- wait for everything -- which is correct but
+        // serialises the copy against the multiply, because the group being waited on is the very one
+        // just issued for the next step. At S == 1 it is -1, an illegal immediate that makes every
+        // launch fail, so the count is clamped rather than left to underflow.
+        pow_cp_async_wait<(POW_STAGES > 2) ? (POW_STAGES - 2) : 0>();
         __syncthreads();
 
         // Issued before the multiply so the copy overlaps it, and fenced after: the group has to be
@@ -960,9 +1075,9 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
             if (lane == 0) {
                 #pragma unroll
                 for (int t = 0; t < POW_BLOCK_COLS; ++t) {
-                    const unsigned int prev = sT[warp][t][slot];
-                    sT[warp][t][slot] = ((prev << POW_HASH_ROT) | (prev >> (32 - POW_HASH_ROT)))
-                                      ^ pv[t];
+const unsigned int prev = POW_ST_AT(warp, t, slot);
+                    POW_ST_AT(warp, t, slot) = ((prev << POW_HASH_ROT) | (prev >> (32 - POW_HASH_ROT)))
+                                           ^ pv[t];
                 }
             }
             __syncwarp();
@@ -983,16 +1098,23 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
 
     unsigned int words[16];
     if (hash_here) {
+        // POW_SKIP_HASH is a benchmark-only ablation: it removes the per-tile BLAKE3 and the
+        // bound compare so the harness can price the hash against the fold. Never defined in the
+        // shipped build, so this is the production path.
+#if defined(POW_SKIP_HASH)
+        if (key_words[0] == 0xffffffffu) { words[0] = 1u; }
+#else
         unsigned char message[64];
         #pragma unroll
         for (int i = 0; i < POW_TRANSCRIPT_WORDS; ++i) {
-            const unsigned int word = sT[warp][tile_in_warp][i];
+            const unsigned int word = POW_ST_AT(warp, tile_in_warp, i);
             message[i * 4]     = (unsigned char)(word);
             message[i * 4 + 1] = (unsigned char)(word >> 8);
             message[i * 4 + 2] = (unsigned char)(word >> 16);
             message[i * 4 + 3] = (unsigned char)(word >> 24);
         }
         b3_chunk_cv(message, 64u, 0ull, key_words, B3_KEYED_HASH, B3_ROOT, words);
+#endif
 
         // The verifier's rule is `U256::from_little_endian(hash_jackpot) <= bound`
         // (`sanity_checks::check_jackpot_against_nbits`), so digest byte 0 is the *least* significant
@@ -1055,7 +1177,7 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
             const int word = rest - t * POW_TRANSCRIPT_WORDS;
             unsigned int value = 0u;
             if (w < rows_valid && t < cols_valid) {
-                value = sT[w][t][word];
+                value = POW_ST_AT(w, t, word);
             }
             transcript_out[block_base * POW_TRANSCRIPT_WORDS + i] = value;
         }

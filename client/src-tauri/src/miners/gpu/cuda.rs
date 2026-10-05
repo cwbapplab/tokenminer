@@ -659,14 +659,34 @@ impl CudaBackend {
     /// and the failure is silent in the worst way -- too few blocks and part of the batch is never
     /// searched at all, and nothing reports it.
     ///
-    /// `16 x 8`, which is also the shape that minimises staged traffic per tile -- `32 x 4` moves half
-    /// again as much and measured 16% slower at production geometry. Not an occupancy story: see the
-    /// note beside `POW_BLOCK_ROWS` in pearl.cu, including the `32 x 4` run that *did* reach two
-    /// blocks per SM and still lost.
+    /// `16 x 12`, chosen by sweeping the rectangle at production geometry against the real kernel
+    /// (`kernels/bench_real.cu` + `sweep_cols.bat`, 8192 tiles per row, one launch per point):
+    ///
+    /// ```text
+    ///   16 x 4   97.1 TH/s
+    ///   16 x 8  130.3 TH/s   (the previous shipped value)
+    ///   16 x 10 135.5 TH/s
+    ///   16 x 12 137.1 TH/s   <- shipped
+    ///   16 x 14 106.2 TH/s   (not a multiple of 8: breaks the ldmatrix B-fragment layout)
+    ///   16 x 16  17.1 TH/s   (96 KB of shared memory incl. the static transcript buffer)
+    /// ```
+    ///
+    /// Wider columns amortise the A operand across more tiles, which is the dominant traffic: a 16x12
+    /// block moves 597 GB per full grid against 768 GB for 16x8, a 22% reduction that buys 5.4%.
+    ///
+    /// The step from 12 to 16 collapses rather than continuing, and bandwidth does not explain it.
+    /// 16x16 fits (80 KB dynamic + 16 KB static `sT` = 96 KB against a 101,376 B opt-in limit) and
+    /// should be *faster* on traffic alone, so something else dominates at 16 columns — most likely
+    /// the `sT` transcript buffer reaching 16 KB, which halves the blocks an SM can hold against
+    /// shared memory. 12 columns keeps the whole footprint at 82 KB.
+    ///
+    /// Every number above is a single launch of `tokenminer_search_grid` itself. A standalone
+    /// reconstruction of the same loop (`bench_ceiling.cu`) predicted 8x8 would be ~20% *faster*; the
+    /// real kernel measured it 44% slower. Geometry here is measured on the shipped kernel only.
     #[cfg(feature = "pearl")]
     const POW_BLOCK_ROWS: usize = 16;
     #[cfg(feature = "pearl")]
-    const POW_BLOCK_COLS: usize = 8;
+    const POW_BLOCK_COLS: usize = 12;
     /// One warp per tile row of a block's rectangle.
     #[cfg(feature = "pearl")]
     const POW_THREADS: u32 = (Self::POW_BLOCK_ROWS * 32) as u32;
@@ -677,6 +697,12 @@ impl CudaBackend {
     const POW_TRANSCRIPT_WORDS: usize = 16;
     #[cfg(feature = "pearl")]
     const POW_TILES_PER_BLOCK: usize = Self::POW_BLOCK_ROWS * Self::POW_BLOCK_COLS;
+    /// The transcript buffer: one 16-word row per warp, per tile column of the block rectangle.
+    /// Mirrors `POW_SMEM_T_BYTES`. Part of the dynamic request because `POW_SMEM_T_DYNAMIC` puts
+    /// `sT` in the same allocation as the staged operands.
+    #[cfg(feature = "pearl")]
+    const POW_SMEM_T_BYTES: usize =
+        Self::POW_BLOCK_ROWS * Self::POW_BLOCK_COLS * Self::POW_TRANSCRIPT_WORDS * 4;
 
     /// k staged at once, which is also the mma instruction's k. `k` and `rank` must both be multiples
     /// of it. Mirrors `POW_BK`.
@@ -710,18 +736,25 @@ impl CudaBackend {
     }
 
     /// Shared memory the search kernel's staged A and B buffers take, from `POW_SMEM_A_BYTES` and
-    /// `POW_SMEM_B_BYTES` in the kernel.
+    /// `POW_SMEM_B_BYTES` in the kernel, **plus the transcript buffer**.
     ///
-    /// The transcript buffer stays `static __shared__`, so it is *not* in this total and must not be
-    /// added to the dynamic request -- the kernel reads `sT` out of the static allocation.
+    /// The transcript buffer (`POW_SMEM_T_BYTES`: one 16-word row per warp per tile column) used to
+    /// be `static __shared__`, which meant it was allocated by the driver *on top* of this request
+    /// and had to be deliberately left out — the kernel read `sT` out of the static allocation. It
+    /// now lives at the end of the same dynamic block (`POW_SMEM_T_DYNAMIC`), so it is part of this
+    /// number and must be added here or the launch requests too little and the transcript writes
+    /// run off the end of the allocation.
     ///
-    /// This is 36,864 on Turing and 61,440 on the tensor path, so only the latter needs the opt-in.
+    /// The two totals differ by exactly the transcript, which is the whole reason `POW_SMEM_BYTES`
+    /// exists separately in the kernel. At the shipped 16x12 that is 70,656 + 12,288 = 82,944 bytes,
+    /// against a 101,376 byte per-block opt-in limit.
     #[cfg(feature = "pearl")]
     fn pow_smem_dynamic_bytes(arch: &str) -> usize {
         Self::POW_STAGES
             * (Self::POW_BLOCK_ROWS + Self::POW_BLOCK_COLS)
             * 16
             * Self::pow_smem_stride(arch)
+            + Self::POW_SMEM_T_BYTES
     }
 
     /// Raises the kernel's dynamic shared-memory ceiling to what [`Self::search_grid`] requests.
