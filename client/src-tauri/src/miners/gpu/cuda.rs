@@ -659,10 +659,11 @@ impl CudaBackend {
     /// and the failure is silent in the worst way -- too few blocks and part of the batch is never
     /// searched at all, and nothing reports it.
     ///
-    /// The geometry is fixed rather than tuned at launch because a block's shared memory use depends
-    /// on all three of rows, cols and stages, and the kernel's is static. See the note beside
-    /// `POW_BLOCK_ROWS` in pearl.cu for the measurements behind the values and for why the 14% faster
-    /// `32 x 4` variant was not taken.
+    /// `16 x 8`, and the shape of the rectangle is not the lever the arithmetic suggests -- see the note
+    /// beside `POW_BLOCK_ROWS` in pearl.cu. `32 x 4` cuts shared-memory traffic by a fifth and is
+    /// measurably slower, because the 64-register accumulator makes a 1024-thread block fill the
+    /// whole register file and cost a second resident block per SM to overlap the per-step barrier
+    /// against. Two blocks per SM is what this geometry is for.
     #[cfg(feature = "pearl")]
     const POW_BLOCK_ROWS: usize = 16;
     #[cfg(feature = "pearl")]
@@ -674,10 +675,58 @@ impl CudaBackend {
     /// of it.
     #[cfg(feature = "pearl")]
     const POW_BK: usize = 32;
+    /// The staged row stride, padding each row past its `POW_BK` bytes to keep the fragment loads off
+    /// the same banks. Mirrors `POW_SMEM_STRIDE`.
+    #[cfg(feature = "pearl")]
+    const POW_SMEM_STRIDE: usize = Self::POW_BK + 16;
+    /// Stages of k in flight. Mirrors `POW_STAGES`.
+    #[cfg(feature = "pearl")]
+    const POW_STAGES: usize = 2;
     #[cfg(feature = "pearl")]
     const POW_TRANSCRIPT_WORDS: usize = 16;
     #[cfg(feature = "pearl")]
     const POW_TILES_PER_BLOCK: usize = Self::POW_BLOCK_ROWS * Self::POW_BLOCK_COLS;
+    /// Shared memory the search kernel's staged A and B buffers take, from `POW_SMEM_A_BYTES` and
+    /// `POW_SMEM_B_BYTES` in the kernel.
+    ///
+    /// The transcript buffer stays `static __shared__`, so it is *not* in this total and must not be
+    /// added to the dynamic request -- the kernel reads `sT` out of the static allocation.
+    #[cfg(feature = "pearl")]
+    const POW_SMEM_DYNAMIC_BYTES: usize = Self::POW_STAGES
+        * (Self::POW_BLOCK_ROWS + Self::POW_BLOCK_COLS)
+        * 16
+        * Self::POW_SMEM_STRIDE;
+
+    /// Raises the kernel's dynamic shared-memory ceiling to what [`Self::search_grid`] requests.
+    ///
+    /// A block gets 48 KiB of shared memory without asking. Above that the launch fails with
+    /// `cudaErrorInvalidValue` until the function's `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`
+    /// is set -- which is what the `32 x 4` geometry needs and what nothing in this launch path used
+    /// to do. That is why `16 x 8` shipped: it fits under the limit without an opt-in.
+    ///
+    /// Set once per function when the module is loaded, not per launch. Doing it per launch would add
+    /// a driver round trip to every batch, and the attribute is a property of the loaded image rather
+    /// than of the search's arguments.
+    ///
+    /// Idempotent, and a failure here is fatal rather than a fallback: a kernel that cannot get its
+    /// shared memory will not launch, and launching it anyway would report the driver error with
+    /// nothing pointing at this.
+    #[cfg(feature = "pearl")]
+    fn pow_opt_in_shared_memory(func: &CudaFunction) -> Result<(), String> {
+        use cudarc::driver::sys::CUfunction_attribute_enum;
+
+        let want = Self::POW_SMEM_DYNAMIC_BYTES as i32;
+        func.set_attribute(
+            CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            want,
+        )
+        .map_err(|e| {
+            format!(
+                "asking for {want} bytes of shared memory per block failed: {e}. A device that \
+                 cannot grant it cannot run this geometry"
+            )
+        })
+    }
 
     /// Searches a batch of 16x16 tiles on the device: fold, hash, bound compare, and claim.
     ///
@@ -798,6 +847,9 @@ impl CudaBackend {
             .map_err(|e| format!("copying the bound failed: {e}"))?;
 
         let kernel = self.function("tokenminer_search_grid")?;
+        // Before the launch, not after: a geometry that needs more than the default 48 KiB fails at
+        // launch time with a driver code that names nothing about shared memory.
+        Self::pow_opt_in_shared_memory(&kernel)?;
         let first_arg = first_tile as u32;
         let tiles_arg = tiles as u32;
         let row_arg = tiles_per_row as u32;
@@ -837,10 +889,9 @@ impl CudaBackend {
             grid_dim: (blocks as u32, 1, 1),
             // One warp per tile row of the rectangle, each warp holding that row's sixteen columns.
             block_dim: (Self::POW_THREADS, 1, 1),
-            // The kernel's staging and transcript buffers are static `__shared__`, so nothing is
-            // requested here. The geometry is chosen to keep the total under the 48 KiB that needs no
-            // `cudaFuncSetAttribute` opt-in; see the note beside `POW_BLOCK_ROWS` in pearl.cu.
-            shared_mem_bytes: 0,
+            // The staged A and B buffers are `extern __shared__`, sized by `pow_opt_in_shared_memory`
+            // above. The transcript buffer is still `static __shared__`, so it is not in this number.
+            shared_mem_bytes: Self::POW_SMEM_DYNAMIC_BYTES as u32,
         };
 
         let mut launch = self.stream.launch_builder(&kernel);

@@ -328,18 +328,43 @@ extern "C" __global__ void tokenminer_fill_i8(
 // dimensions. The per-tile form runs at about 66% of an RTX 5080's DRAM bandwidth and cannot go
 // faster; this one needs under a third of it and is bound by instruction issue instead.
 //
-// These four are measured, not guessed. On an RTX 5080 `16 x 8 x 2` sustains ~40M tiles/s and
-// `16 x 8 x 3` ~38M, so a third stage buys nothing and costs shared memory. `32 x 4 x 2` reaches
-// ~46M but needs 63,488 bytes of shared memory, which nvcc has to promote from static to dynamic --
-// and a dynamic shared-memory block above 48 KiB does not launch on sm_75 without an explicit
-// `cudaFuncSetAttribute` opt-in that nothing in this launch path does. Staying under 48 KiB is worth
-// more than the 14%, so the shipped geometry fits in static shared memory on every arch in
-// `build.rs`'s list, `cp.async` or not.
+// These four are measured, not guessed, and the measurement contradicts the obvious arithmetic.
+//
+// Per staged k-step a block moves `POW_BLOCK_ROWS * 16 * POW_BK` bytes of A and
+// `POW_BLOCK_COLS * 16 * POW_BK` of B through shared memory for `POW_BLOCK_ROWS * POW_BLOCK_COLS *
+// 16 * 16 * POW_BK` multiply-accumulates, so per-tile traffic is `POW_BK * (1 / cols + 1 / rows)`.
+// That is minimised by splitting the rectangle as evenly as it can go, and `32 x 4` beats `16 x 8` on
+// paper -- 256 bytes per tile-step against 320, a fifth less shared-memory traffic.
+//
+// On an RTX 5080 it is also 4.5% *slower*, and the reason is occupancy rather than bandwidth. The
+// accumulator is 64 registers per lane whichever way the rectangle is cut, so a block costs
+// `64 * POW_THREADS` of the 65,536-register file: `16 x 8` spends half of it and fits two blocks per
+// SM, `32 x 4` spends all of it and fits one. Every k-step ends in a `__syncthreads()`, and with a
+// single resident block there is nothing to overlap that barrier against -- the whole SM stalls at
+// each of the `k / POW_BK` steps waiting for the slowest warp. Two blocks interleave those stalls,
+// which is worth more than the traffic it costs. Measured: 63.8M tiles/s at `16 x 8`, 60.9M at
+// `32 x 4`.
+//
+// So the rectangle stays `16 x 8`, and the lever that would actually help is the one this leaves
+// open: `POW_SMEM_STRIDE` pads every staged row by 50%, so the block spends 45,056 bytes where
+// 36,864 would do, and two blocks is the most that fits either way. Getting to three needs a stride
+// of 32, which needs an XOR swizzle to keep the fragment loads off the same banks -- that is the
+// next thing to try, not a bigger rectangle.
 #define POW_BLOCK_ROWS 16
 #define POW_BLOCK_COLS 8
 #define POW_WARPS POW_BLOCK_ROWS
 #define POW_THREADS (POW_WARPS * 32)
 #define POW_TILES_PER_BLOCK (POW_BLOCK_ROWS * POW_BLOCK_COLS)
+
+/// Marks the staging buffers as dynamic rather than static `__shared__`.
+///
+/// Every architecture stages through one dynamic allocation. A static `__shared__` array is capped at
+/// 48 KiB on every card we ship for -- sm_75 included, whose 64 KiB budget does not raise that cap
+/// for static arrays -- and `32 x 4` needs more than that before the transcript buffer is counted, so
+/// static cannot express this geometry at all. The host raises the dynamic ceiling per function with
+/// `cudaFuncSetAttribute` before the first launch; see `pow_opt_in_shared_memory`.
+#define POW_DYNAMIC_SMEM 1
+extern __shared__ signed char pow_dynamic_smem[];
 
 // Which fold this architecture gets.
 //
@@ -375,6 +400,14 @@ extern "C" __global__ void tokenminer_fill_i8(
 // Stages in flight. Two is the fewest that overlap the next k-step's copy with the current one's
 // multiply, and a barrier is needed between them either way.
 #define POW_STAGES 2
+
+// Bytes of shared memory a block's three buffers take, laid out contiguously in the dynamic
+// allocation: A, then B, then the transcript. `POW_SMEM_STRIDE` pads each staged row, so these
+// scale with the geometry rather than with the data.
+#define POW_SMEM_A_BYTES (POW_STAGES * POW_BLOCK_ROWS * 16 * POW_SMEM_STRIDE)
+#define POW_SMEM_B_BYTES (POW_STAGES * POW_BLOCK_COLS * 16 * POW_SMEM_STRIDE)
+#define POW_SMEM_T_BYTES (POW_WARPS * POW_BLOCK_COLS * POW_TRANSCRIPT_WORDS * 4)
+#define POW_SMEM_BYTES (POW_SMEM_A_BYTES + POW_SMEM_B_BYTES + POW_SMEM_T_BYTES)
 
 __device__ __forceinline__ unsigned int pow_ld32(const signed char* p) {
     return *reinterpret_cast<const unsigned int*>(p);
@@ -543,9 +576,26 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
         unsigned int tiles_per_region,
         int k,
         int rank) {
-    __shared__ signed char sA[POW_STAGES][POW_BLOCK_ROWS * 16 * POW_SMEM_STRIDE];
-    __shared__ signed char sB[POW_STAGES][POW_BLOCK_COLS * 16 * POW_SMEM_STRIDE];
+    // The staged A and B buffers are one dynamic allocation, sliced here in the order `POW_SMEM_*_BYTES`
+    // lays them out, which is what puts the geometry's shared-memory cost in one place the host can
+    // be checked against. The transcript buffer is still `static __shared__`: it is small enough that
+    // it fits the static cap on its own, and leaving it static keeps it out of the launch's
+    // `shared_mem_bytes`.
+    signed char* const smem = pow_dynamic_smem;
     __shared__ unsigned int sT[POW_WARPS][POW_BLOCK_COLS][POW_TRANSCRIPT_WORDS];
+
+    // Typed views of the staged operands, so the rest of the kernel keeps indexing them as
+    // `[stage][row * POW_SMEM_STRIDE]` and cannot drift out of step with the allocation above.
+    //
+    // A and B need separate types: one stage of A is `POW_BLOCK_ROWS` rows and one stage of B is
+    // `POW_BLOCK_COLS`, so a shared typedef makes `sB[1]` step by the wrong stride and the second
+    // stage lands outside the allocation. That is not a subtle arithmetic slip either -- it is an
+    // out-of-bounds write on every launch past stage zero, which compute-sanitizer reports as an
+    // invalid `__shared__` write and the driver surfaces as an illegal address on the next call.
+    typedef signed char pow_a_stage_t[POW_BLOCK_ROWS * 16 * POW_SMEM_STRIDE];
+    typedef signed char pow_b_stage_t[POW_BLOCK_COLS * 16 * POW_SMEM_STRIDE];
+    pow_a_stage_t* const sA = reinterpret_cast<pow_a_stage_t*>(smem);
+    pow_b_stage_t* const sB = reinterpret_cast<pow_b_stage_t*>(smem + POW_SMEM_A_BYTES);
 
     const int tid = threadIdx.x;
     const int warp = tid / 32;
