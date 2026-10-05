@@ -421,13 +421,31 @@ extern "C" __global__ void tokenminer_fill_i8(
 // of loads** per thread, which is no trade at any occupancy. The rectangle has to shrink to fit, and
 // every rectangle that fits measures slower (above).
 //
-// **The two ways past ~138 TH/s**, both of which are rewrites rather than schedule changes:
-//   1. *A decomposition that does not hold the whole k-deep accumulator in registers.* Split the k
-//      loop across warps and land partial sums in shared memory, freeing the register file for
-//      occupancy. The profile says this is the binding constraint.
-//   2. *Fewer instructions per multiply.* The same `mma` count with no `ldmatrix` operand loads runs
-//      at **228 TH/s** against 138 here, so the fragment loads are eating the issue slots.
-//      `ldmatrix.x4` already replaces four `LDS.32` per operand; m16n8k32 offers no wider fragment.
+// **The two ways past ~138 TH/s**, both of which are rewrites rather than schedule
+// changes, and both of which were tried on this branch and measured a loss:
+//
+//   1. *Split a tile row's columns across warps.* Halves the accumulator per lane
+//      (48 registers at 12 columns with a split of 2), which is exactly the register
+//      relief the profile says occupancy needs. Measured on the real kernel:
+//      ```text
+//        16x12 split=1  137.9 TH/s   1 block/SM    <- shipped
+//        16x12 split=2  115.6 TH/s   1 block/SM
+//        16x12 split=2, min 2 blocks/SM   115.5 TH/s   (registers now fit; still slower)
+//        16x8  split=2, min 2 blocks/SM   127.9 TH/s
+//         8x8  split=2, min 2 blocks/SM    72.7 TH/s
+//      ```
+//      The reason is that the A operand depends on the tile row alone, so every column
+//      slice of a row re-loads the same A fragment. The split halves the accumulator but
+//      doubles the A `ldmatrix` count, and an issue-bound kernel pays for that more than
+//      it gains from the second block. A split of 3 or more cannot even launch at 16 rows:
+//      `POW_THREADS = 16 * 3 * 32 = 1536`, the thread limit per SM, so the launch is
+//      refused before it can be timed.
+//   2. *Fewer instructions per multiply.* The same `mma` count with no `ldmatrix`
+//      operand loads runs at **228 TH/s** against 138 here — but the fragment loads are
+//      not removable: `m16n8k32` reads its operands from registers that only `ldmatrix`
+//      fills, and `ldmatrix.x4` already replaces four `LDS.32` per operand. m16n8k32
+//      offers no wider fragment, so there is no instruction that does the same multiply
+//      with fewer loads.
 //
 // What *did* move it, for the record: widening columns 8 -> 12 is +5.4% and `POW_SMEM_T_DYNAMIC`
 // a further +0.5%. Neither is 200 TH/s, and neither was close.
