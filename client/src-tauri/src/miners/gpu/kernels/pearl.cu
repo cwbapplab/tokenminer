@@ -421,6 +421,21 @@ extern "C" __global__ void tokenminer_fill_i8(
 // of loads** per thread, which is no trade at any occupancy. The rectangle has to shrink to fit, and
 // every rectangle that fits measures slower (above).
 //
+// **Split-k was considered and rejected without a rewrite.** Partitioning the k
+// loop across warps or blocks and landing partial sums in shared memory was the
+// remaining candidate for cutting the register footprint, because the two splits
+// above only divide the accumulator across a tile's *columns* or *rows*. It does
+// not work, and the reason is structural rather than a matter of tuning: the
+// accumulator is per *tile*, and every k contributes to every tile, so a warp
+// folding a k-slice still holds a complete 16x16 accumulator for that slice. A
+// probe kernel built to test exactly this — 16x12, k split across two warps,
+// partials accumulated into shared memory via `atomicAdd` — compiles to the same
+// **128 registers per thread** as the shipped kernel (`-Xptxas -v`, zero spills
+// either way). Split-k buys no register relief, so it cannot lift the occupancy
+// the profile says is binding, and it would add a cross-block reduction at every
+// rank boundary (CUDA has no cross-block synchronisation but a second launch).
+// Rejected on that measurement rather than left as an open idea.
+//
 // **The two ways past ~138 TH/s**, both of which are rewrites rather than schedule
 // changes, and both of which were tried on this branch and measured a loss:
 //
