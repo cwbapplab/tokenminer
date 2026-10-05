@@ -1129,15 +1129,17 @@ mod tests {
     /// in the end-to-end test is cheap.
     ///
     /// `k = 1024` is the floor the verifier sets — below it the 1024-byte matrix padding is not
-    /// collision resistant — and `rank = 32` is its floor too. Together they sit at exactly
-    /// `k = 16r`, the same ratio `k = 4096, r = 256` runs at in production, so the fold walks the
-    /// same number of rank blocks per tile dimension at both sizes.
+    /// collision resistant. `rank = 64` is the smallest value the GPU search can fold at on every
+    /// architecture: the tensor path stages 64 k and the DP4A path 32, and a `rank` below the staged
+    /// width zeroes `steps_per_rank`. Together they sit at exactly `k = 16r`, the same ratio
+    /// `k = 4096, r = 256` runs at in production, so the fold walks the same number of rank blocks
+    /// per tile dimension at both sizes.
     fn test_mining() -> PearlMining {
         PearlMining {
             m: 48,
             n: 48,
             k: 1024,
-            rank: 32,
+            rank: 64,
             rows_pattern: (0..TILE as u32).collect(),
             cols_pattern: (0..TILE as u32).collect(),
             gzip: false,

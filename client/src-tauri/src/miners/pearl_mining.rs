@@ -126,9 +126,19 @@ pub fn small_mining() -> PearlMining {
         m: 48,
         n: 48,
         // k = 1024 is the floor `public_params_sanity_check` sets for the chunk padding to be
-        // collision resistant, and rank 32 its floor for noise generation.
+        // collision resistant, and rank 64 its floor for noise generation doubled to the smallest
+        // value the GPU search can fold at.
+        //
+        // The search stages `pow_bk(arch)` k at once — 64 on the tensor path, 32 on Turing's DP4A
+        // fold — and a `rank` below the staged width makes `steps_per_rank` zero, which is a device
+        // divide by zero rather than a wrong answer. 64 is the smallest value both paths accept, so
+        // one fixture checks the same thing on every card. It also puts this at `k = 16r`, the ratio
+        // production runs at (4096 / 256), which 32 did not.
+        //
+        // Consensus does not care either way: the reference rejects `rank < PENALTY_BASE_RANK`
+        // (128) outright, so the old 32 was below what a real block could carry regardless.
         k: 1024,
-        rank: 32,
+        rank: 64,
         rows_pattern: (0..16).collect(),
         cols_pattern: (0..16).collect(),
         gzip: false,

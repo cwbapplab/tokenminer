@@ -670,14 +670,6 @@ impl CudaBackend {
     /// One warp per tile row of a block's rectangle.
     #[cfg(feature = "pearl")]
     const POW_THREADS: u32 = (Self::POW_BLOCK_ROWS * 32) as u32;
-    /// k staged at once, which is also the mma instruction's k. `k` and `rank` must both be multiples
-    /// of it.
-    #[cfg(feature = "pearl")]
-    const POW_BK: usize = 32;
-    /// The staged row stride, padding each row past its `POW_BK` bytes to keep the fragment loads off
-    /// the same banks. Mirrors `POW_SMEM_STRIDE`.
-    #[cfg(feature = "pearl")]
-    const POW_SMEM_STRIDE: usize = Self::POW_BK + 16;
     /// Stages of k in flight. Mirrors `POW_STAGES`.
     #[cfg(feature = "pearl")]
     const POW_STAGES: usize = 2;
@@ -685,16 +677,52 @@ impl CudaBackend {
     const POW_TRANSCRIPT_WORDS: usize = 16;
     #[cfg(feature = "pearl")]
     const POW_TILES_PER_BLOCK: usize = Self::POW_BLOCK_ROWS * Self::POW_BLOCK_COLS;
+
+    /// k staged at once, which is also the mma instruction's k. `k` and `rank` must both be multiples
+    /// of it. Mirrors `POW_BK`.
+    ///
+    /// **This is a function, not a constant, because the kernel stages differently by architecture.**
+    /// The split mirrors the kernel's own `POW_DP4A`, which is `__CUDA_ARCH__ < 800`: Turing has no
+    /// int8 tensor cores and folds with DP4A, and that path's staging array doubles with the stage
+    /// width, so at 64 it spills 76 bytes against 20 at 32. Every architecture with tensor cores
+    /// stages 64, which is worth **+77%** at production geometry -- see the note beside `POW_BK` in
+    /// `kernels/pearl.cu` for the measurement and the stall breakdown that explains it.
+    ///
+    /// This mirrors the cubin that is actually loaded, so it has to be derived from `arch` rather
+    /// than fixed at compile time: the same host runs either fold depending on the card it finds.
+    #[cfg(feature = "pearl")]
+    fn pow_bk(arch: &str) -> usize {
+        // `arch_code` is the exact `__CUDA_ARCH__` value the cubin was compiled for, so this is the
+        // same predicate the kernel used rather than a second place to keep the arch table in sync.
+        // A cubin loaded for an arch `arch_code` does not know cannot have been loaded at all --
+        // `arch_for` and the cubin lookup both reject it earlier.
+        match arch_code(arch) {
+            Some(code) if code < 800 => 32,
+            _ => 64,
+        }
+    }
+
+    /// The staged row stride, padding each row past its `POW_BK` bytes to keep the fragment loads off
+    /// the same banks. Mirrors `POW_SMEM_STRIDE`.
+    #[cfg(feature = "pearl")]
+    fn pow_smem_stride(arch: &str) -> usize {
+        Self::pow_bk(arch) + 16
+    }
+
     /// Shared memory the search kernel's staged A and B buffers take, from `POW_SMEM_A_BYTES` and
     /// `POW_SMEM_B_BYTES` in the kernel.
     ///
     /// The transcript buffer stays `static __shared__`, so it is *not* in this total and must not be
     /// added to the dynamic request -- the kernel reads `sT` out of the static allocation.
+    ///
+    /// This is 36,864 on Turing and 61,440 on the tensor path, so only the latter needs the opt-in.
     #[cfg(feature = "pearl")]
-    const POW_SMEM_DYNAMIC_BYTES: usize = Self::POW_STAGES
-        * (Self::POW_BLOCK_ROWS + Self::POW_BLOCK_COLS)
-        * 16
-        * Self::POW_SMEM_STRIDE;
+    fn pow_smem_dynamic_bytes(arch: &str) -> usize {
+        Self::POW_STAGES
+            * (Self::POW_BLOCK_ROWS + Self::POW_BLOCK_COLS)
+            * 16
+            * Self::pow_smem_stride(arch)
+    }
 
     /// Raises the kernel's dynamic shared-memory ceiling to what [`Self::search_grid`] requests.
     ///
@@ -715,10 +743,10 @@ impl CudaBackend {
     /// shared memory will not launch, and launching it anyway would report the driver error with
     /// nothing pointing at this.
     #[cfg(feature = "pearl")]
-    fn pow_opt_in_shared_memory(func: &CudaFunction) -> Result<(), String> {
+    fn pow_opt_in_shared_memory(func: &CudaFunction, arch: &str) -> Result<(), String> {
         use cudarc::driver::sys::CUfunction_attribute_enum;
 
-        let want = Self::POW_SMEM_DYNAMIC_BYTES as i32;
+        let want = Self::pow_smem_dynamic_bytes(arch) as i32;
         func.set_attribute(
             CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             want,
@@ -775,10 +803,17 @@ impl CudaBackend {
         // The fold runs once per staged k-step, and `rank` says how often. A `rank` that is not a whole
         // number of them never fires the fold at all, so every transcript comes back zero and the
         // search reports nothing -- no error, no wrong share, just no mining.
-        if !k.is_multiple_of(Self::POW_BK) || !rank.is_multiple_of(Self::POW_BK) {
+        //
+        // The staged width is architecture-dependent (see [`Self::pow_bk`]), so this has to test the
+        // width the loaded cubin actually uses: a `rank` below the tensor path's 64 is legal on
+        // Turing's 32 and illegal here, and `steps_per_rank` being zero is a device-side divide by
+        // zero rather than anything this could catch on the way in.
+        let pow_bk = Self::pow_bk(self.arch);
+        if !k.is_multiple_of(pow_bk) || !rank.is_multiple_of(pow_bk) {
             return Err(format!(
-                "k {k} and rank {rank} both have to be multiples of the {} the fold stages at once",
-                Self::POW_BK
+                "k {k} and rank {rank} both have to be multiples of the {pow_bk} the fold stages at \
+                 once on {arch}",
+                arch = self.arch
             ));
         }
         if tiles_per_row == 0 || tiles_per_region == 0 {
@@ -852,7 +887,7 @@ impl CudaBackend {
         let kernel = self.function("tokenminer_search_grid")?;
         // Before the launch, not after: a geometry that needs more than the default 48 KiB fails at
         // launch time with a driver code that names nothing about shared memory.
-        Self::pow_opt_in_shared_memory(&kernel)?;
+        Self::pow_opt_in_shared_memory(&kernel, self.arch)?;
         let first_arg = first_tile as u32;
         let tiles_arg = tiles as u32;
         let row_arg = tiles_per_row as u32;
@@ -894,7 +929,7 @@ impl CudaBackend {
             block_dim: (Self::POW_THREADS, 1, 1),
             // The staged A and B buffers are `extern __shared__`, sized by `pow_opt_in_shared_memory`
             // above. The transcript buffer is still `static __shared__`, so it is not in this number.
-            shared_mem_bytes: Self::POW_SMEM_DYNAMIC_BYTES as u32,
+            shared_mem_bytes: Self::pow_smem_dynamic_bytes(self.arch) as u32,
         };
 
         let mut launch = self.stream.launch_builder(&kernel);
@@ -2250,14 +2285,16 @@ impl CudaBackend {
         // different partitions of the same grid. A region size that lined up with the tile row would
         // let a swap between the two go unnoticed.
         //
-        // `k` and `rank` are the smallest the search kernel accepts: it stages 32 k at a time and
-        // folds once per rank, so a `rank` that is not a multiple of 32 never folds at all and every
-        // transcript comes back zero. `k = 128, rank = 32` gives four rank blocks, so the fold's
-        // running-totals behaviour is exercised and not just its first iteration.
+        // `k` and `rank` are the smallest the search kernel accepts: it stages `pow_bk(arch)` k at a time
+        // and folds once per rank, so a `rank` that is not a multiple of the staged width never folds
+        // at all and every transcript comes back zero. The staged width is 64 on the tensor path and
+        // 32 on Turing's DP4A fold, so 64 is the width both accept — and `k = 128, rank = 64` still
+        // gives two rank blocks, so the fold's running-totals behaviour is exercised and not just its
+        // first iteration.
         //
         // A 3x2 grid is also short on both axes of the kernel's 16x8 block rectangle, so this runs the
         // short-rectangle paths on every invocation.
-        let (m_tiles, n_tiles, k, rank) = (3usize, 2usize, 128usize, 32usize);
+        let (m_tiles, n_tiles, k, rank) = (3usize, 2usize, 128usize, 64usize);
         let tile = 16usize;
         let tiles_per_region = n_tiles;
         let tiles = m_tiles * n_tiles;
@@ -2275,12 +2312,6 @@ impl CudaBackend {
                 .wrapping_add(salt);
             (((mixed >> 33) & 0x7F) as i8) - 64
         };
-        let a = (0..m_tiles * tile * k)
-            .map(|i| signal(i, 11))
-            .collect::<Vec<i8>>();
-        let b = (0..n_tiles * tile * k)
-            .map(|i| signal(i, 29))
-            .collect::<Vec<i8>>();
 
         // Not a constant: a key of all one bytes would still exercise every line, but a digest that
         // came out unchanged across a wrong key would be easier to miss.
@@ -2288,7 +2319,7 @@ impl CudaBackend {
 
         // Each tile's digest, computed one tile at a time through the checked fold. The grid then has
         // to find the same tile the per-tile path priced, which is the whole claim.
-        let digest_of = |tile_row: usize, tile_col: usize| -> Result<U256, String> {
+        let digest_of = |a: &[i8], b: &[i8], tile_row: usize, tile_col: usize| -> Result<U256, String> {
             let tile_a = &a[tile_row * tile * k..][..tile * k];
             let tile_b = &b[tile_col * tile * k..][..tile * k];
             let words = self.jackpot_fold(tile_a, tile_b, k, rank, tile, tile)?;
@@ -2297,12 +2328,59 @@ impl CudaBackend {
             ))
         };
 
-        let mut priced: Vec<((usize, usize), U256)> = Vec::with_capacity(tiles);
-        for tile_row in 0..m_tiles {
-            for tile_col in 0..n_tiles {
-                priced.push(((tile_row, tile_col), digest_of(tile_row, tile_col)?));
+        // **The operands are searched for, not pinned.** The offset check at the bottom of this
+        // function is only meaningful when the grid's lowest digest lands off tile row 0, since row 0
+        // is where a batch that ignored `first_tile` would look anyway. That depends on the digests,
+        // so it depends on `k`, `rank` and the staged width -- which is to say it moves whenever the
+        // geometry does, and a salt chosen once goes stale silently: the check stops testing the
+        // offset and starts testing nothing, while still reading as a pass.
+        //
+        // So try salts until one puts the lowest candidate somewhere other than row 0. Which tile wins
+        // is a hash, so this is a coin flip per attempt and a handful of tries is ample; the whole
+        // loop is a few folds of a `k = 128` tile, and it runs on start-up only.
+        //
+        // The salt has to reach `signal`'s *sampled* bits to do anything: it takes 33..40 of
+        // `i * GOLDEN + salt`, so adding a small number to the salt perturbs only the low bits and
+        // leaves every output byte identical. The attempt is therefore folded in through a multiply,
+        // which moves it across the whole word. A first attempt at this searched `11 + 2 * attempt`
+        // and all 32 tries produced the same digests -- which is how the loop below was found to be
+        // inert at all, since 32 failures at two-in-three odds is not something a working search does.
+        let mix = |base: u64, attempt: u64| -> u64 {
+            base.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(attempt.wrapping_mul(0xD6E8_FEB8_6659_FD93))
+        };
+        let mut chosen: Option<(Vec<i8>, Vec<i8>, Vec<((usize, usize), U256)>)> = None;
+        for attempt in 0..32u64 {
+            let a = (0..m_tiles * tile * k)
+                .map(|i| signal(i, mix(11, attempt)))
+                .collect::<Vec<i8>>();
+            let b = (0..n_tiles * tile * k)
+                .map(|i| signal(i, mix(29, attempt)))
+                .collect::<Vec<i8>>();
+
+            let mut priced: Vec<((usize, usize), U256)> = Vec::with_capacity(tiles);
+            for tile_row in 0..m_tiles {
+                for tile_col in 0..n_tiles {
+                    priced.push(((tile_row, tile_col), digest_of(&a, &b, tile_row, tile_col)?));
+                }
+            }
+
+            let lowest = priced
+                .iter()
+                .min_by_key(|(_, digest)| *digest)
+                .ok_or("the tile grid produced no candidates to search")?;
+            if lowest.0 .0 != 0 {
+                chosen = Some((a, b, priced));
+                break;
             }
         }
+        let (a, b, priced) = chosen.ok_or_else(|| {
+            format!(
+                "no salt out of 32 put the tile grid's lowest candidate off tile row 0 in a \
+                 {m_tiles}x{n_tiles} grid, so the batch-offset check below cannot be given \
+                 operands it can distinguish"
+            )
+        })?;
 
         let a_dev = self
             .stream
@@ -2477,15 +2555,12 @@ impl CudaBackend {
         // which is unique, and lives in some row R. A kernel that searched row 0 instead finds no
         // qualifying tile there and claims nothing. The flip side is that this is blind when R is 0,
         // because then the offset-ignoring kernel finds the same tile and reports the same coordinate
-        // for the wrong reason — so that case says so rather than passing.
-        let ((target_row, target_col), target_digest) = *lowest;
-        if target_row == 0 {
-            return Err(format!(
-                "the tile grid's lowest candidate, ({target_row}, {target_col}), is in the first \
-                 tile row, which is where a batch that ignored its offset would search regardless; \
-                 change the operands so the lowest candidate is somewhere else"
-            ));
-        }
+        // for the wrong reason — so that case is ruled out above, by choosing operands that do not
+        // put the winner there, rather than by failing here and asking for a hand edit.
+        let ((target_row, target_col), target_digest) = *priced
+            .iter()
+            .min_by_key(|(_, digest)| *digest)
+            .ok_or("the tile grid produced no candidates to search")?;
         // One tile row per region, so the batch is exactly the row it was pointed at.
         let won = self.search_grid(
             &a_dev,
@@ -2545,9 +2620,14 @@ impl CudaBackend {
         // Off a block multiple on at least one axis, and `rank` a whole number of the staged k so the
         // fold fires more than once. The last shape is a batch that does not start at the top of the
         // grid, which is the only one that can see an operand row read from the wrong place.
+        //
+        // `rank` is 64 rather than 32 because the staged k is architecture-dependent — 32 on Turing's
+        // DP4A fold, 64 on the tensor path (see `pow_bk`) — and a `rank` below the staged width is
+        // rejected outright rather than mis-folded. 64 is the width both paths accept, so these
+        // shapes check the same thing on every card. Production runs at `rank = 256`.
         let shapes: [(usize, usize, usize, usize, usize); 4] = [
-            (11, 6, 128, 32, 0),
-            (16, 16, 128, 32, 0),
+            (11, 6, 128, 64, 0),
+            (16, 16, 128, 64, 0),
             (19, 3, 256, 128, 0),
             (24, 6, 256, 128, 16),
         ];

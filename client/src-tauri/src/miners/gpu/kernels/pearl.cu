@@ -348,12 +348,14 @@ extern "C" __global__ void tokenminer_fill_i8(
 // doubled occupancy bought. Do not re-derive this as a barrier-overlap story: the doubled occupancy
 // was real and it did not pay.
 //
-// So the rectangle stays `16 x 8`, and the lever that would actually help is the one this leaves
-// open: `POW_SMEM_STRIDE` pads every staged row by 50%, so the block spends 45,056 bytes where
-// 36,864 would do. That is not the occupancy lever either -- at one block per SM the register file,
-// not shared memory, is the binding constraint -- but it is what stands between this geometry and a
-// smaller stride, and a stride of 32 needs an XOR swizzle to keep the fragment loads off the same
-// banks. That is the next thing to try, not a bigger rectangle.
+// So the rectangle stays `16 x 8`. The lever that actually helped was neither of those: it was
+// staging two `mma` k-blocks per step instead of one, which halves the barriers per unit of
+// multiply-accumulates and measured **+77%** (see `POW_BK`). `POW_SMEM_STRIDE` still pads every
+// staged row -- the block spends 70,656 bytes where 49,152 would do -- but that is not the occupancy
+// lever: at one block per SM both the register file and shared memory are already at their limit, and
+// the profiler puts shared memory at one block as well as registers. A stride of 32 would need an
+// XOR swizzle to keep the fragment loads off the same banks; at 64 that swizzle is not optional,
+// because an unpadded 64 is `0 (mod 32)` and every `ldmatrix` would cost four times what it should.
 #define POW_BLOCK_ROWS 16
 #define POW_BLOCK_COLS 8
 #define POW_WARPS POW_BLOCK_ROWS
@@ -406,18 +408,47 @@ extern __shared__ __align__(16) signed char pow_dynamic_smem[];
 #define POW_LDMATRIX 1
 #endif
 
-// k staged per tile. `mma.m16n8k32` takes k = 32, so this is exactly one instruction's worth and a
-// staged buffer is one fragment deep. The DP4A fold consumes the same 32 bytes as four four-byte
-// dots per lane, so the staging, the step count and the fold schedule are shared by both paths and
-// only the multiply differs.
+// k staged per tile. `mma.m16n8k32` takes k = 32, so a 64-wide stage is exactly two instructions'
+// worth and the DP4A fold consumes the same 32 bytes as four four-byte dots per lane, so the
+// staging, the step count and the fold schedule are shared by both paths and only the multiply
+// differs.
+//
+// **The tensor path stages 64, the DP4A path 32, and the reason is measured, not a preference.**
+// At 32 the step loop issues one `mma` k-block between a `cp.async` wait and a `BAR.SYNC`, and the
+// profiler named that barrier as the single largest stall in the kernel -- 3.99 of 15.67 cycles per
+// issued instruction, ahead of every other term. Widening the stage to 64 halves the barriers per
+// unit of multiply-accumulates: the same stall falls to 0.92, the total to 10.56, and the top stall
+// becomes `math_pipe_throttle`, which is the one that means the math pipe is the constraint.
+// Five alternating runs at production geometry put this at **+77%**, 71.7 -> 127.1 TMAC/s, with no
+// overlap between the two ranges. It also drops `long_scoreboard` from 2.34 to 0.52: a deeper step
+// hides the `cp.async` latency on its own, which is why stage depth on its own never paid.
+//
+// Turing keeps 32. Its `aw[2][POW_BK / 4]` staging array doubles with the stage width, and at 64 the
+// DP4A path spills 76 bytes against 20 at 32 -- both already capped at 128 registers by
+// `__launch_bounds__`. A card with no tensor cores to begin with is the wrong place to spend
+// registers on hiding a barrier, so the two paths stage differently and the host mirrors the split.
+//
+// `rank` must be a whole number of stages or `steps_per_rank` is zero and the fold's modulo divides
+// by zero; the host checks that, and a stage width above `rank` is the easy way to hit it.
+#if POW_DP4A
 #define POW_BK 32
+#else
+#define POW_BK 64
+#endif
 
-// The shared row stride: 48 bytes rather than 32. A 32-byte stride is 8 banks wide, so the eight row
-// starts a lane group touches fold onto each other four deep and every fragment load costs four times
-// what it should. 48 bytes is 12 banks, and lane `l` reads word `row * 12 + l % 4` -- 32 distinct
-// banks. Padding rather than XOR swizzling, because it keeps the copy and the fragment load as plain
-// 16- and 32-bit accesses; a swizzle would have to be undone by the same code that wrote it, and
-// there is nothing to buy for it.
+// The shared row stride: `POW_BK + 16`, so every staged row is padded past its own width. An unpadded
+// stride is a poor choice: 32 is 8 banks wide, so the eight row starts a lane group touches fold onto
+// each other four deep and every fragment load costs four times what it should. Padding to `POW_BK + 16`
+// is 12 banks at `POW_BK` 32 and 20 at 64, and both give lane `l` eight distinct row starts. Padding
+// rather than XOR swizzling, because it keeps the copy and the
+// fragment load as plain 16- and 32-bit accesses; a swizzle would have to be undone by the same code
+// that wrote it, and there is nothing to buy for it.
+//
+// The rule that makes this work is `stride == 16 (mod 32)`, which is what keeps `ldmatrix`
+// conflict-free: a matrix reads eight rows of 16 bytes, so their row starts must land on eight
+// distinct bank groups. 48 and 80 both satisfy it; **64 does not** -- 64 is `0 (mod 32)`, so rows
+// alternate between two starts and every `ldmatrix` costs four times what it should. That is worth
+// knowing because 64 is the width a stage wants most, and it is why the pad is there.
 #define POW_SMEM_STRIDE (POW_BK + 16)
 
 // Stages in flight. Two is the fewest that overlap the next k-step's copy with the current one's
@@ -435,10 +466,11 @@ extern __shared__ __align__(16) signed char pow_dynamic_smem[];
 //
 // `POW_SMEM_T_BYTES` is deliberately *not* in it: the transcript buffer is static `__shared__`, which
 // the driver allocates on top of whatever the launch asks for. A launch that passes `POW_SMEM_BYTES`
-// instead double-counts the transcript, and at this geometry that is 45,056 + 9,216 = 54,272 against
-// the 48 KiB a block gets with no opt-in -- so the launch fails with `cudaErrorInvalidValue` and names
+// instead double-counts the transcript, and on the tensor path that is 61,440 + 8,192 = 69,632
+// against a 48 KiB default -- so the launch fails with `cudaErrorInvalidValue` and names
 // nothing about shared memory. The two totals differ by exactly the transcript, which is the whole
-// reason both names exist.
+// reason both names exist. This is no longer hypothetical: at `POW_BK` 64 the tensor path asks for
+// 61,440 bytes and genuinely needs the opt-in `pow_opt_in_shared_memory` performs.
 #define POW_SMEM_DYNAMIC_BYTES (POW_SMEM_A_BYTES + POW_SMEM_B_BYTES)
 
 // The whole per-block shared-memory footprint, for sizing a carveout or checking a budget against the
@@ -513,11 +545,11 @@ __device__ __forceinline__ void pow_mma(unsigned int* d, unsigned int a0, unsign
 //
 // **No swizzle is needed, and that is worth being sure about rather than assuming.** `ldmatrix`
 // reads eight rows of 16 bytes per matrix, so a matrix is conflict-free exactly when its eight rows
-// start on 32 distinct banks. `POW_SMEM_STRIDE` is 48 bytes = 12 banks, and twelve divides evenly
-// into thirty-two's factors, so rows 0-7 start at banks 0, 12, 24, 4, 16, 28, 8, 20 -- eight
-// distinct starts, and each row's four banks are disjoint from the rest. The pitch was chosen to make
-// the `LDS.32` path conflict-free and it happens to satisfy `ldmatrix` too; the two choices are not
-// in tension and there is nothing to buy from replacing it.
+// start on 32 distinct banks. `POW_SMEM_STRIDE` is `16 (mod 32)` at either stage width, so rows 0-7
+// land on eight distinct starts and each row's four banks are disjoint from the rest: 48 bytes gives
+// banks 0, 12, 24, 4, 16, 28, 8, 20, and 80 gives 0, 20, 8, 28, 16, 4, 24, 12. The pitch was chosen
+// to make the `LDS.32` path conflict-free and it happens to satisfy `ldmatrix` too; the two choices
+// are not in tension and there is nothing to buy from replacing it.
 //
 // `smem` must be 16-byte aligned, which the 48-byte stride preserves for every row and offset here,
 // and which the `__shared__` declarations state explicitly because the `cp.async` above needs it too.
@@ -850,32 +882,45 @@ extern "C" __global__ __launch_bounds__(POW_THREADS) void tokenminer_search_grid
             // reused across all eight tile columns -- which is what the rectangle's rows axis buys --
             // and one per tile column for B, each covering both eight-column halves at once.
             unsigned int a[4];
-            pow_ldmatrix_x4(a, sA[rd] + warp * 16 * POW_SMEM_STRIDE, lane);
-
+            // One `ldmatrix` per 32-byte k-block, so a 64-wide stage issues two per tile and the
+            // barrier above is amortised over twice the multiply-accumulates. `ldmatrix` addresses
+            // 16 bytes within the block it is given, so the block index is just a pointer offset --
+            // which also keeps every fragment address 16-byte aligned, as the copy that wrote it was.
             #pragma unroll
-            for (int t = 0; t < POW_BLOCK_COLS; ++t) {
-                unsigned int b[4];
-                pow_ldmatrix_x4(b, sB[rd] + t * 16 * POW_SMEM_STRIDE, lane);
-                pow_mma(acc[t][0], a[0], a[1], a[2], a[3], b[0], b[2]);
-                pow_mma(acc[t][1], a[0], a[1], a[2], a[3], b[1], b[3]);
+            for (int kb = 0; kb < POW_BK / 32; ++kb) {
+                pow_ldmatrix_x4(a, sA[rd] + warp * 16 * POW_SMEM_STRIDE + kb * 32, lane);
+
+                #pragma unroll
+                for (int t = 0; t < POW_BLOCK_COLS; ++t) {
+                    unsigned int b[4];
+                    pow_ldmatrix_x4(b, sB[rd] + t * 16 * POW_SMEM_STRIDE + kb * 32, lane);
+                    pow_mma(acc[t][0], a[0], a[1], a[2], a[3], b[0], b[2]);
+                    pow_mma(acc[t][1], a[0], a[1], a[2], a[3], b[1], b[3]);
+                }
             }
 #else
             const signed char* a_row = sA[rd] + (warp * 16 + lane_group) * POW_SMEM_STRIDE;
             const signed char* a_row_hi = a_row + 8 * POW_SMEM_STRIDE;
 
-            const unsigned int a0 = pow_ld32(a_row + lane_k);
-            const unsigned int a1 = pow_ld32(a_row_hi + lane_k);
-            const unsigned int a2 = pow_ld32(a_row + lane_k_hi);
-            const unsigned int a3 = pow_ld32(a_row_hi + lane_k_hi);
-
+            // As above, one pass per 32-byte k-block within the stage; `lane_k` and `lane_k_hi`
+            // address the four k values each side of an `mma` fragment, and `kb * 32` steps to the
+            // next one along the staged row.
             #pragma unroll
-            for (int t = 0; t < POW_BLOCK_COLS; ++t) {
+            for (int kb = 0; kb < POW_BK / 32; ++kb) {
+                const unsigned int a0 = pow_ld32(a_row + kb * 32 + lane_k);
+                const unsigned int a1 = pow_ld32(a_row_hi + kb * 32 + lane_k);
+                const unsigned int a2 = pow_ld32(a_row + kb * 32 + lane_k_hi);
+                const unsigned int a3 = pow_ld32(a_row_hi + kb * 32 + lane_k_hi);
+
                 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    const signed char* b_row =
-                        sB[rd] + (t * 16 + h * 8 + lane_group) * POW_SMEM_STRIDE;
-                    pow_mma(acc[t][h], a0, a1, a2, a3,
-                            pow_ld32(b_row + lane_k), pow_ld32(b_row + lane_k_hi));
+                for (int t = 0; t < POW_BLOCK_COLS; ++t) {
+                    #pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const signed char* b_row =
+                            sB[rd] + (t * 16 + h * 8 + lane_group) * POW_SMEM_STRIDE + kb * 32;
+                        pow_mma(acc[t][h], a0, a1, a2, a3,
+                                pow_ld32(b_row + lane_k), pow_ld32(b_row + lane_k_hi));
+                    }
                 }
             }
 #endif
