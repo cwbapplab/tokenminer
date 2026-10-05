@@ -321,43 +321,94 @@ extern "C" __global__ void tokenminer_fill_i8(
 // --- Block geometry ---------------------------------------------------------------------------
 //
 // A block owns a `POW_BLOCK_ROWS` x `POW_BLOCK_COLS` rectangle of the tile grid rather than a single
-// tile, and that is the entire reason this kernel is not memory-bound. One tile per block re-reads
-// both of its operands whole: sixteen rows of `k` from each side, so `32 * k` bytes moved for
-// `16 * 16 * k` multiply-accumulates. A rectangle amortises each side across the other axis --
-// `16 * k * (1/cols + 1/rows)` bytes per tile -- which is 12 KiB against 128 KiB at the shipped
-// dimensions. The per-tile form runs at about 66% of an RTX 5080's DRAM bandwidth and cannot go
-// faster; this one needs under a third of it and is bound by instruction issue instead.
+// tile, and that is why this kernel is not as memory-bound as its naive form. One tile per block
+// re-reads both of its operands whole: sixteen rows of `k` from each side, so `32 * k` bytes moved
+// for `16 * 16 * k` multiply-accumulates. A rectangle amortises each side across the other axis --
+// `16 * k * (1/cols + 1/rows)` bytes per tile.
 //
-// These four are measured, not guessed, and the measurement agrees with the arithmetic once the
-// arithmetic is done in the right order.
+// **This kernel is still bandwidth-bound, just less badly.** An earlier version of this comment said
+// otherwise — "not memory-bound", "bound by instruction issue" — and the arithmetic now contradicts
+// it. At the shipped geometry a block reads `ROWS*16*k` bytes of A and `COLS*16*k` of B and there are
+// `(tiles/ROWS) * (tiles/COLS)` blocks per grid, so a full 8192x8192-tile grid moves **597 GB** from
+// DRAM to read 1 GB of operands. Over the 539 ms the shipped 16x8 took to fold it, that is 1.53 TB/s
+// against an RTX 5080's ~1.79 TB/s peak — about 85% of achievable bandwidth. That is the ceiling
+// this kernel is actually pressing against, and it is why occupancy changes lose (see the geometry
+// note below) and why widening columns is the lever that works.
 //
-// Per staged k-step a block moves `POW_BLOCK_ROWS * 16 * POW_BK` bytes of A and
-// `POW_BLOCK_COLS * 16 * POW_BK` of B through shared memory for `POW_BLOCK_ROWS * POW_BLOCK_COLS *
-// 16 * 16 * POW_BK` multiply-accumulates, so per-tile traffic is `POW_BK * (1 / cols + 1 / rows)`
-// bytes. That is minimised by splitting the rectangle as evenly as it can go, and it is the shipped
-// `16 x 8` that wins it, not `32 x 4`: 6.0 bytes per tile against 9.0. `32 x 4` moves **half again**
-// as much shared-memory traffic, because halving `cols` doubles the A term and only a quarter of the
-// saving comes back from doubling `rows`.
+// Ablations that price the rest of the loop, all on the real kernel at production geometry:
+//   - the per-tile BLAKE3 and bound compare cost **0.6%** (compile with `-DPOW_SKIP_HASH`). The
+//     fold is the entire cost; the hash is free alongside it.
+//   - `cp.async.ca` (cache in L1) is **worse** than `.cg`: 122.4 against 130.7 at 16x8, and 113.4
+//     against 137.0 at 16x12. The staged bytes are read once per block and L1 space is better spent
+//     on nothing, so `.cg` stays the default. (This also corrects the older claim below that the
+//     staged bytes are "never reused by another block" — they *are* reused, by the ~683 other
+//     column strips reading the same A rows, and caching them in L1 still loses because the reuse is
+//     too far apart in time to hit L1's lifetime.)
+//   - an L2-locality swizzle of the block index (`POW_L2_GROUP`) changes nothing measurable: 130.1
+//     at group 1 against 130.6 at 2 and 130.5 at 32. With 84 SMs and one block each, the concurrently
+//     resident blocks already span the whole grid, so there is no grouping that improves locality.
 //
-// Measured on an RTX 5080 at production geometry, `32 x 4` is **16% slower** -- 61.9 against 73.5
-// TMAC/s -- which is what the traffic term predicts and nothing else needs to explain. It is *not* an
-// occupancy effect. The accumulator is 64 registers per lane either way, and the register file is
-// what caps residency: this kernel compiles to 98 registers, and 98 * 512 = 50,176 against 65,536,
-// so it sits at **one** block per SM. `32 x 4` measured 64 registers and *did* reach two blocks per
-// SM -- 32 warps against 16 -- and still lost, because the traffic it added cost more than the
-// doubled occupancy bought. Do not re-derive this as a barrier-overlap story: the doubled occupancy
-// was real and it did not pay.
+// The remaining lever that arithmetic says *should* work is a squarer rectangle, since traffic scales
+// as `1/ROWS + 1/COLS` — but `POW_BLOCK_ROWS` is tied to the thread count (`POW_THREADS = ROWS*32`),
+// and going to 16x16 spills registers hard (see `POW_MIN_BLOCKS`) for a measured 62 TH/s.
 //
-// So the rectangle stays `16 x 8`. The lever that actually helped was neither of those: it was
-// staging two `mma` k-blocks per step instead of one, which halves the barriers per unit of
-// multiply-accumulates and measured **+77%** (see `POW_BK`). `POW_SMEM_STRIDE` still pads every
-// staged row -- the block spends 70,656 bytes where 49,152 would do -- but that is not the occupancy
-// lever: at one block per SM both the register file and shared memory are already at their limit, and
-// the profiler puts shared memory at one block as well as registers. A stride of 32 would need an
-// XOR swizzle to keep the fragment loads off the same banks; at 64 that swizzle is not optional,
+// **The register file caps the rectangle at area 256, and that is the ceiling on this algorithm.**
+// The accumulator is `COLS * 2 * 4` registers per lane and a block has `ROWS * 32` lanes, so a
+// block's accumulator costs `ROWS * COLS * 256` registers — independent of how the work is split
+// across warps. sm_120 has 65,536 registers per SM, so `ROWS * COLS <= 256` however the block is
+// organised, and `32 x 8` would need 65,536 registers for the accumulator alone. The minimum
+// possible operand traffic is therefore `16 * k * (1/R + 1/C)`, minimised at `R = C = 16`. Every
+// rectangle measured, at production geometry:
+// ```text
+//   16x12  137.9 TH/s   area 192    <- shipped
+//   24x8   111.2 TH/s   area 192
+//   12x16   98.4 TH/s   area 192
+//    8x24   76.6 TH/s   area 192
+//   16x16   62.4 TH/s   area 256    (spills 592 B: 16 columns is 128 acc registers per lane)
+// ```
+// Note that area alone does not predict throughput — 16x12 beats 12x16 at identical area, because
+// widening *columns* amortises the larger operand and the `ldmatrix` B-fragment layout needs a
+// multiple of 8 columns. But the ceiling is near: the theoretical best at area 256 is roughly
+// 2x the shipped rectangle's traffic improvement, and it cannot be built without spilling.
+//
+// So ~138 TH/s is what this fold does on this hardware, and it is a bandwidth wall rather than a
+// tuning failure. Reaching materially past it needs a different arithmetic decomposition — one that
+// keeps the whole k-deep accumulator out of registers — not a better schedule of this one.
+//
+// `POW_SMEM_STRIDE` pads every staged row, so a block spends more shared memory than the data needs.
+// That is not an occupancy lever at one block per SM — both the register file and shared memory are
+// already the binding limit, and the profiler puts them at the same place. A stride of 32 would need
+// an XOR swizzle to keep the fragment loads off the same banks; at 64 that swizzle is not optional,
 // because an unpadded 64 is `0 (mod 32)` and every `ldmatrix` would cost four times what it should.
+//
 // Overridable so the benchmark harness can A/B a geometry without editing this file. The shipped
 // values are the defaults; nothing sets these in the real build.
+//
+// **Why 16 x 12 and not something with better occupancy.** On sm_120 this kernel runs at ONE block
+// per SM, and the obvious fix — get two resident — is measurably worse. Two blocks/SM needs both
+// `regs * threads <= 32768` and total shared memory `<= 51200` B, and the accumulator alone costs
+// `ROWS * COLS * 2 * 4 * 32` registers per block. That admits only small rectangles, and small
+// rectangles pay for it in operand traffic. Measured on the real kernel at production geometry:
+//
+// ```text
+//   16x12  138.7 TH/s   1 block/SM    <- shipped
+//   16x8   130.3 TH/s   1 block/SM
+//    8x8    74.5 TH/s   2 blocks/SM   (regs=120, 45 KB)
+//   12x8    94.1 TH/s   2 blocks/SM
+//    8x10   72.8 TH/s   2 blocks/SM
+//   16x4    97.1 TH/s   2 blocks/SM
+// ```
+//
+// Doubled occupancy loses to halved operand reuse, by a wide margin. Traffic is the constraint here,
+// not latency hiding. Do not re-derive this as an occupancy story.
+//
+// The traffic arithmetic behind it: each block reads `ROWS*16*k` bytes of A and `COLS*16*k` of B, and
+// there are `(tiles/ROWS) * (tiles/COLS)` blocks per grid, so traffic per grid is
+// `(tiles/ROWS)*(tiles/COLS) * (ROWS+COLS)*16*k` — i.e. it scales as `1/ROWS + 1/COLS`. Minimised by
+// a square rectangle, which is why the column sweep below rises to 12 and then falls.
+//
+// What *did* move it: widening columns from 8 to 12 cuts traffic 768 GB -> 597 GB per grid for
+// 5.4%, and `POW_SMEM_T_DYNAMIC` buys a further 0.5%. Neither is dramatic, and neither is 200 TH/s.
 #ifndef POW_BLOCK_ROWS
 #define POW_BLOCK_ROWS 16
 #endif
