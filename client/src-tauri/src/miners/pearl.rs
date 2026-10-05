@@ -53,24 +53,11 @@ pub fn start(
         mining.rank
     );
 
-    // Report the GPU we will mine on, and prove the embedded image works on it. This is the gate:
-    // a backend that cannot compute the jackpot or hash correctly must not mine.
-    match super::gpu::probe() {
-        Some(mut backend) => {
-            let described = backend.device().describe();
-            match backend.self_test() {
-                Ok(()) => log::info!("pearl: GPU {} usable — {described}", backend.name()),
-                Err(error) => {
-                    log::warn!(
-                        "pearl: GPU {} failed its self-test: {error}",
-                        backend.name()
-                    )
-                }
-            }
-            backend.shutdown();
-        }
-        None => log::info!("pearl: no GPU backend available on this machine"),
-    }
+    // The GPU is not probed here. `GpuMiner::open` self-tests the device on the
+    // miner thread as its gate — a backend that cannot compute the jackpot or hash
+    // correctly must not mine — so a second self-test here would run the kernel
+    // twice per start, once on this thread while the caller holds the global miner
+    // mutex. The failure still surfaces, through the miner thread's own report.
 
     let field = |name: &str| {
         config
@@ -95,7 +82,7 @@ pub fn start(
     if let (Some(host), Some(wallet)) = (host, wallet) {
         let worker = field("worker").unwrap_or_default();
 
-        let handle = stratum::spawn(
+        let (handle, stop) = stratum::spawn(
             app.clone(),
             PrlConfig {
                 host,
@@ -111,6 +98,7 @@ pub fn start(
             status,
             miner: Some(handle),
             poller: None,
+            stop: Some(stop),
         });
     }
 

@@ -153,11 +153,16 @@ extern "C" __global__ void tokenminer_noise_perm(
         unsigned int* out) {
     const unsigned long long stride = (unsigned long long)blockDim.x * gridDim.x;
 
-    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-         i < count;
-         i += stride) {
-        const unsigned int hash_index = first_index + (unsigned int)(i / 8u);
-        const unsigned int slot = (unsigned int)(i % 8u);
+    // One thread per hash, not per pair: a digest yields eight pairs, so a
+    // thread hashes once and writes all eight. The previous shape let eight
+    // threads share a `hash_index` (`i / 8`), each hashing the identical
+    // message to keep a single four-byte slot — eight hashes where one would
+    // do. `count` is the pair count, so the loop bound is its ceiling over
+    // eight.
+    for (unsigned long long h = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         h * 8u < (unsigned long long)count;
+         h += stride) {
+        const unsigned int hash_index = first_index + (unsigned int)h;
 
         unsigned char message[64];
         b3_noise_message(message, seed_words, hash_index, 1u);
@@ -168,16 +173,24 @@ extern "C" __global__ void tokenminer_noise_perm(
         unsigned char digest[32];
         b3_store_words(digest, words);
 
-        const unsigned int word = (unsigned int)digest[slot * 4]
-                                | ((unsigned int)digest[slot * 4 + 1] << 8)
-                                | ((unsigned int)digest[slot * 4 + 2] << 16)
-                                | ((unsigned int)digest[slot * 4 + 3] << 24);
+        #pragma unroll
+        for (unsigned int slot = 0; slot < 8u; ++slot) {
+            const unsigned long long i = h * 8u + slot;
+            if (i >= (unsigned long long)count) {
+                break;
+            }
 
-        const unsigned int first = word & (rank - 1u);
-        const unsigned int second = first ^ (1u + b3_mul_hi_u32(rank - 1u, word));
+            const unsigned int word = (unsigned int)digest[slot * 4]
+                                    | ((unsigned int)digest[slot * 4 + 1] << 8)
+                                    | ((unsigned int)digest[slot * 4 + 2] << 16)
+                                    | ((unsigned int)digest[slot * 4 + 3] << 24);
 
-        out[i * 2] = first;
-        out[i * 2 + 1] = second;
+            const unsigned int first = word & (rank - 1u);
+            const unsigned int second = first ^ (1u + b3_mul_hi_u32(rank - 1u, word));
+
+            out[i * 2] = first;
+            out[i * 2 + 1] = second;
+        }
     }
 }
 

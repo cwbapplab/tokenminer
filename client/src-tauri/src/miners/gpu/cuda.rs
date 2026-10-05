@@ -1246,6 +1246,10 @@ impl CudaBackend {
     /// Each pair is two column indices into a dense row of length `rank`: a `+1` at the first and a
     /// `-1` at the second. Composing the two tensors is two loads and a subtract per entry, which is
     /// why the reference never materialises a dense `M x K` noise matrix either.
+    ///
+    /// One BLAKE3 digest yields eight pairs, so `count` pairs cost `count / 8`
+    /// hashes: the kernel writes all eight per thread rather than eight threads
+    /// hashing the same message and each keeping a single four-byte slot.
     #[cfg(feature = "pearl")]
     pub fn fill_noise_perm(
         &self,
@@ -1280,7 +1284,9 @@ impl CudaBackend {
             .arg(&count_arg)
             .arg(&rank_arg)
             .arg(out);
-        unsafe { launch.launch(grid_for(count)) }
+        // One hash yields eight pairs, so the grid is an eighth of the pair
+        // count — `tokenminer_noise_perm` writes all eight per thread.
+        unsafe { launch.launch(grid_for(count.div_ceil(8))) }
             .map_err(|e| format!("launching tokenminer_noise_perm failed: {e}"))?;
 
         Ok(())

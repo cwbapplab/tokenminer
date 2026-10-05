@@ -85,6 +85,11 @@ pub fn start(
         tauri::async_runtime::spawn(async move {
             if let Err(error) = miner_metrics::start_http_exporter(port).await {
                 log::error!("failed to start miner metrics exporter: {error}");
+                // The latch is set before the bind, so a failed bind has to
+                // clear it — otherwise a restart after a port conflict finds
+                // the one-shot already spent and leaves telemetry dead for the
+                // rest of the process.
+                EXPORTER_STARTED.store(false, Ordering::SeqCst);
             }
         });
     }
@@ -139,6 +144,10 @@ pub fn start(
         status,
         miner: Some(miner),
         poller: Some(poller),
+        // Quantus has no flag to set: its workers cancel when their pool is
+        // dropped (see `WorkerPool`'s `Drop` in the service crate), which
+        // aborting the task below does.
+        stop: None,
     })
 }
 

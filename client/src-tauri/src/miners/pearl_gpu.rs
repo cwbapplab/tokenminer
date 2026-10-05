@@ -608,6 +608,22 @@ fn validate(mining: &PearlMining, config: &MiningConfiguration) -> Result<usize,
         return Err(format!("n is {n}, which is fewer than one {TILE}-row tile"));
     }
 
+    // The grid kernel carries every tile coordinate and the tile count in
+    // `u32` — `first_tile`, `tiles`, `tiles_per_row`, and the
+    // `tr * tiles_per_row + tc` that picks a region flag. `m` and `n`
+    // fitting in `u32` is not enough: the product `(m / TILE) * (n / TILE)`
+    // is what overflows, and a wrapped index would address the wrong tile or
+    // the wrong flag rather than fail. Checked here, before the workspace is
+    // sized from the same dimensions.
+    let tiles_per_col = m / TILE;
+    let total_tiles = (tiles_per_row as u64) * (tiles_per_col as u64);
+    if total_tiles > u32::MAX as u64 {
+        return Err(format!(
+            "the tile grid is {tiles_per_col} x {tiles_per_row} = {total_tiles} tiles, \
+             which does not fit in the 32-bit indices the search kernel is built from"
+        ));
+    }
+
     Ok(REGIONS_PER_BATCH.min(tiles_per_row))
 }
 
@@ -621,8 +637,12 @@ fn validate(mining: &PearlMining, config: &MiningConfiguration) -> Result<usize,
 fn footprint(m: usize, n: usize, k: usize, rank: usize, regions: usize) -> usize {
     let a = padded(m * k);
     let bt = padded(n * k);
-    // Two levels of eight-word chaining values per 1024-byte chunk, live at the same time.
-    let cv_scratch = 2 * (a / CHUNK) * CV_WORDS * size_of::<u32>();
+    // Two levels of eight-word chaining values per 1024-byte chunk, live at the
+    // same time — one level being written while the previous is combined. The
+    // commitment builds a tree over each matrix in turn, so the larger of the two
+    // sizes the scratch, not `a` alone: at `m < n` the `bt` tree is the bigger
+    // one, and a footprint sized from `a` under-counts it by the difference.
+    let cv_scratch = 2 * (a.max(bt) / CHUNK) * CV_WORDS * size_of::<u32>();
 
     a * 2
         + bt * 2

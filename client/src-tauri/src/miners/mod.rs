@@ -4,6 +4,7 @@
 //! processes. Each engine is gated behind a Cargo feature so it can be built
 //! independently (`quantus`, `pearl`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,14 @@ pub struct Started {
     pub status: Arc<Mutex<MinerStatus>>,
     pub miner: Option<tauri::async_runtime::JoinHandle<()>>,
     pub poller: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// Signals the engine's own worker loops to unwind.
+    ///
+    /// `stop_miner` sets this before aborting the task handles: a
+    /// `JoinHandle::abort` cancels the async task but cannot reach a plain OS
+    /// thread the engine spawned, so those threads have to observe this flag
+    /// and exit on their own. `None` for an engine whose workers cancel some
+    /// other way (Quantus's cancel when their pool is dropped).
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 /// One engine's live state and background tasks.
@@ -132,6 +141,8 @@ pub struct EngineSlot {
     pub status: Arc<Mutex<MinerStatus>>,
     pub miner: Option<tauri::async_runtime::JoinHandle<()>>,
     pub poller: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// The running session's stop signal, if it has one. See [`Started::stop`].
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 impl EngineSlot {
@@ -140,6 +151,7 @@ impl EngineSlot {
             status: Arc::new(Mutex::new(MinerStatus::new(kind))),
             miner: None,
             poller: None,
+            stop: None,
         }
     }
 
@@ -279,6 +291,7 @@ fn start_engine(
             slot.status = started.status;
             slot.miner = started.miner;
             slot.poller = started.poller;
+            slot.stop = started.stop;
 
             emit_log(
                 app,
@@ -465,12 +478,21 @@ pub fn stop_miner(
 ) -> Result<MinerStatus, String> {
     let mut manager = state.miners.lock().map_err(|_| "miner state is poisoned")?;
 
+    let slot = manager.slot_mut(kind);
+
+    // Signal the engine's own worker loops first. Aborting the task
+    // handles below cancels the async tasks, but a plain OS thread the
+    // engine spawned keeps running — holding the device and its memory —
+    // until it sees this flag, which nothing else ever sets.
+    if let Some(stop) = slot.stop.as_ref() {
+        stop.store(true, Ordering::SeqCst);
+    }
+
     match kind {
         MinerKind::Quantus => quantus::stop(&app),
         MinerKind::Pearl => pearl::stop(),
     }
 
-    let slot = manager.slot_mut(kind);
     if let Some(handle) = slot.miner.take() {
         handle.abort();
     }
