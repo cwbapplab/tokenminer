@@ -508,6 +508,53 @@ extern "C" __global__ void tokenminer_fill_i8(
 #ifndef POW_HASH_DIRECT
 #define POW_HASH_DIRECT 0
 #endif
+
+// ---- Harvested techniques from `super3/llmjob` (see memory: llmjob-pearl-miner-reference). ----
+//
+// All five are compile-time switches, default off, so the shipped path is byte-identical to what it
+// was before the harvest. Every number that motivated them was measured on *their* hardware — mostly
+// an RTX 4090 at 450 W, one RTX 5090 session — and their sm_120 fold measures below ours, so none of
+// these is assumed to transfer. They exist to be measured here, not believed.
+//
+// 1. `POW_MBARRIER_RING`: replace the per-step `__syncthreads` with a ring of mbarriers, so a warp
+//    that finishes its readout early can move to the next stage without waiting for the whole block.
+//    Their +5.6% was on a 192x256 tile; ours is 16x12, and the barrier stall is already 0.92 cycles
+//    after `POW_BK` 64, so the headroom is smaller than theirs was.
+// 2. The wide geometry: 256-thread blocks, eight warps, each warp owning a 32x64 tile instead of a
+//    16x16 one. The point is the register cap: a 256-thread block lets ptxas use 255 registers a
+//    lane instead of 128, which is the resource this kernel is capped on. Their +3.0% was Ada.
+// 3. B-direct: B never goes through shared — the host writes it fragment-ordered and each warp
+//    pulls its fragments with `LDG.128` one k-step ahead. Removes half the staged traffic. Only
+//    viable inside the wide geometry: at 128 registers a lane the B fragments do not fit alongside
+//    the accumulator, which is exactly why their B-direct build sits at 253 registers.
+//
+// 2 and 3 are not defines: both kernels are compiled for every arch, so a `-D` here would change
+// nothing. They are chosen at runtime by `TOKENMINER_POW_KERNEL` (see `PowKernel` in `cuda.rs`),
+// which is what lets one build be measured against another without recompiling. 1, 4 and 5 change
+// code inside a kernel that already exists, so they do need a rebuild.
+// 4. `POW_XOR_SWIZZLE`: bank conflicts killed by storing 16-byte unit `q` of row `r` at unit
+//    `q XOR (r mod 8)` instead of padding the stride. Only meaningful at `POW_BK` 128 — a 64-byte
+//    stage row spans two bank groups, so no swizzle can make eight rows land on eight distinct
+//    starts; the row has to be eight units wide first. Their stride is 128 for exactly this reason.
+// 5. `POW_SERPENTINE`: odd L2 groups walk their column strips in reverse, so each group starts on
+//    the B columns the one before it ended on. Their win was a DRAM-read reduction on a 4090's L2;
+//    our DRAM is 56% and not the wall, so expect little, but it is a scheduling change only.
+#ifndef POW_MBARRIER_RING
+#define POW_MBARRIER_RING 0
+#endif
+#ifndef POW_WIDE_WARPS
+#define POW_WIDE_WARPS 0
+#endif
+#ifndef POW_B_DIRECT
+#define POW_B_DIRECT 0
+#endif
+#ifndef POW_XOR_SWIZZLE
+#define POW_XOR_SWIZZLE 0
+#endif
+#ifndef POW_SERPENTINE
+#define POW_SERPENTINE 0
+#endif
+
 #define POW_WARPS POW_BLOCK_ROWS
 #define POW_THREADS (POW_WARPS * 32)
 #define POW_TILES_PER_BLOCK (POW_BLOCK_ROWS * POW_BLOCK_COLS)
@@ -596,20 +643,41 @@ extern __shared__ __align__(16) signed char pow_dynamic_smem[];
 #endif
 #endif
 
-// The shared row stride: `POW_BK + 16`, so every staged row is padded past its own width. An unpadded
-// stride is a poor choice: 32 is 8 banks wide, so the eight row starts a lane group touches fold onto
-// each other four deep and every fragment load costs four times what it should. Padding to `POW_BK + 16`
-// is 12 banks at `POW_BK` 32 and 20 at 64, and both give lane `l` eight distinct row starts. Padding
-// rather than XOR swizzling, because it keeps the copy and the
-// fragment load as plain 16- and 32-bit accesses; a swizzle would have to be undone by the same code
-// that wrote it, and there is nothing to buy for it.
+// `POW_XOR_SWIZZLE` replaces the pad with the swizzle: 16-byte unit `q` of row `r` is stored at unit
+// `q XOR (r mod 8)`, which is an involution, so the staging store and the fragment load apply the
+// same transform and no undo is needed. It only pays at `POW_BK` 128, where a stage row is eight
+// units wide and the swizzle can spread eight rows across eight distinct bank groups; at 64 the row
+// spans two groups and no swizzle can fix that, so the pad stays. Wired for the `ldmatrix` path only
+// — the `LDS.32` path would have to undo the same transform, and there is nothing to buy by doing it
+// twice.
+#if POW_XOR_SWIZZLE
+#if POW_BK != 128
+#error "POW_XOR_SWIZZLE needs a 128-byte stage row: build with -DPOW_BK=128"
+#endif
+#if !POW_LDMATRIX
+#error "POW_XOR_SWIZZLE is only wired for the ldmatrix path"
+#endif
+#define POW_SMEM_STRIDE POW_BK
+__device__ __forceinline__ int pow_swz_unit(int row, int unit) {
+    return unit ^ (row & 7);
+}
+#else
+#define POW_SMEM_STRIDE (POW_BK + 16)
+#endif
+
+// The shared row stride: `POW_BK + 16` padded, or the unpadded `POW_BK` under `POW_XOR_SWIZZLE`
+// (defined above). An unpadded stride is a poor choice at the widths this kernel ships: 32 is 8 banks
+// wide, so the eight row starts a lane group touches fold onto each other four deep and every
+// fragment load costs four times what it should. Padding to `POW_BK + 16` is 12 banks at `POW_BK` 32
+// and 20 at 64, and both give lane `l` eight distinct row starts.
 //
-// The rule that makes this work is `stride == 16 (mod 32)`, which is what keeps `ldmatrix`
+// The rule that makes the pad work is `stride == 16 (mod 32)`, which is what keeps `ldmatrix`
 // conflict-free: a matrix reads eight rows of 16 bytes, so their row starts must land on eight
 // distinct bank groups. 48 and 80 both satisfy it; **64 does not** -- 64 is `0 (mod 32)`, so rows
 // alternate between two starts and every `ldmatrix` costs four times what it should. That is worth
-// knowing because 64 is the width a stage wants most, and it is why the pad is there.
-#define POW_SMEM_STRIDE (POW_BK + 16)
+// knowing because 64 is the width a stage wants most, and it is why the pad is there. The swizzle is
+// the alternative that buys the pad's bytes back, but only once the row is eight units wide — at
+// `POW_BK` 128 — which is why the two are gated on the stage width.
 
 // Stages in flight, defined with the rest of the geometry above so a benchmark can override it.
 // Two is the fewest that overlap the next k-step's copy with the current one's multiply, and a
@@ -717,7 +785,13 @@ __device__ __forceinline__ void pow_mma(unsigned int* d, unsigned int a0, unsign
 __device__ __forceinline__ void pow_ldmatrix_x4(unsigned int* out, const signed char* smem,
                                                 int lane) {
     const int row = (lane & 7) + 8 * ((lane >> 3) & 1);
+    // The same transform the staging store applied. `smem` is a tile start, which is a multiple of
+    // sixteen rows, so `row & 7` here is the same key the store used for the absolute row.
+#if POW_XOR_SWIZZLE
+    const int koff = pow_swz_unit(row, lane >> 4) * 16;
+#else
     const int koff = (lane >> 4) * 16;
+#endif
     const unsigned int addr =
         (unsigned int)__cvta_generic_to_shared(smem + row * POW_SMEM_STRIDE + koff);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -746,6 +820,36 @@ __device__ __forceinline__ void pow_cp_async_fence() {
 #endif
 }
 
+// `POW_MBARRIER_RING`: the per-step `__syncthreads` replaced by a ring of mbarriers, one FULL and one
+// EMPTY per stage. Producers signal FULL when their copies for a stage land (via
+// `cp.async.mbarrier.arrive`, which is asynchronous — the thread does not stall on its own copies);
+// consumers wait FULL before reading and signal EMPTY when done. The difference from the barrier is
+// where the lockstep sits: with `__syncthreads` every warp stops at the same point, while with the
+// ring a warp that finishes its readout seam early can move to the next stage while a slower warp is
+// still reading. It needs `POW_STAGES >= 3` to actually overlap — at 2 the producer gate lands on the
+// same point the barrier used to be. sm_80+ only; the switch falls back to the plain barrier below.
+#if POW_MBARRIER_RING
+__device__ __forceinline__ unsigned int pow_mbar_addr(const unsigned long long* bar) {
+    return (unsigned int)__cvta_generic_to_shared(bar);
+}
+__device__ __forceinline__ void pow_mbar_init(unsigned int addr, unsigned int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(addr), "r"(count));
+}
+__device__ __forceinline__ void pow_mbar_arrive(unsigned int addr) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" :: "r"(addr));
+}
+__device__ __forceinline__ void pow_cp_async_mbar_arrive(unsigned int addr) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" :: "r"(addr));
+}
+__device__ __forceinline__ void pow_mbar_wait(unsigned int addr, unsigned int parity) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n"
+        "L1:\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+        "@p bra L2;\n\tbra L1;\nL2:\n}\n"
+        :: "r"(addr), "r"(parity));
+}
+#endif
+
 /// One 16-byte copy per thread, global to shared.
 ///
 /// `chunk` walks the staged rows in `POW_BK / 16`-byte pieces, so the *caller's* loop bound is what
@@ -761,7 +865,11 @@ __device__ __forceinline__ void pow_stage_copy(signed char* smem,
                                                int kk,
                                                int chunk) {
     const int row = chunk / (POW_BK / 16);
+#if POW_XOR_SWIZZLE
+    const int offset = pow_swz_unit(row, chunk % (POW_BK / 16)) * 16;
+#else
     const int offset = (chunk % (POW_BK / 16)) * 16;
+#endif
     signed char* dst = smem + row * POW_SMEM_STRIDE + offset;
     const signed char* from = src + (long long)row * ldm + kk + offset;
 #if __CUDA_ARCH__ >= 800
@@ -957,6 +1065,15 @@ extern "C" __global__ __launch_bounds__(POW_THREADS, POW_MIN_BLOCKS) void tokenm
         const unsigned int within = blockIdx.x - group * (POW_L2_GROUP * cols_per_strip);
         const unsigned int g_strip = within / cols_per_strip;
         col_block = within - g_strip * cols_per_strip;
+        // `POW_SERPENTINE`: odd groups walk their column strips in reverse, so each group starts on
+        // the B columns the one before it ended on. Their measured win was a DRAM-read reduction on a
+        // 4090's L2 (2.08 -> 0.60 GB per launch); on this card DRAM is 56% and not the wall, so this
+        // is a scheduling change whose value has to be measured here, not assumed from theirs.
+#if POW_SERPENTINE
+        if (group & 1) {
+            col_block = cols_per_strip - 1 - col_block;
+        }
+#endif
         strip = group * POW_L2_GROUP + g_strip;
     } else {
         strip = blockIdx.x / cols_per_strip;
@@ -1019,6 +1136,25 @@ extern "C" __global__ __launch_bounds__(POW_THREADS, POW_MIN_BLOCKS) void tokenm
     }
     __syncthreads();
 
+#if POW_MBARRIER_RING
+    // One FULL and one EMPTY mbarrier per stage. FULL expects every thread's `cp.async` arrive;
+    // EMPTY expects one arrival per fold warp (lane 0), so the producer gate waits for all readers.
+    __shared__ __align__(8) unsigned long long pow_mbar_full[POW_STAGES];
+    __shared__ __align__(8) unsigned long long pow_mbar_empty[POW_STAGES];
+    if (tid < POW_STAGES) {
+        pow_mbar_init(pow_mbar_addr(&pow_mbar_full[tid]), POW_THREADS);
+        pow_mbar_init(pow_mbar_addr(&pow_mbar_empty[tid]), POW_WARPS);
+    }
+    __syncthreads();
+    // The first `POW_STAGES - 1` stages are written before any consumer has read them, so their EMPTY
+    // gates start pre-cleared: one arrival per warp now, so the first producer pass does not block.
+    if (lane == 0) {
+        for (int s = 0; s < POW_STAGES - 1; ++s) {
+            pow_mbar_arrive(pow_mbar_addr(&pow_mbar_empty[s]));
+        }
+    }
+#endif
+
     // Never reset between rank blocks: the fold reads the running totals.
     //
     // Both layouts spend the same 64 registers per lane on a warp's whole 16x16 tile, and both index
@@ -1059,8 +1195,24 @@ extern "C" __global__ __launch_bounds__(POW_THREADS, POW_MIN_BLOCKS) void tokenm
         for (int chunk = tid; chunk < cols_valid * 16 * (POW_BK / 16); chunk += POW_THREADS) {
             pow_stage_copy(sB[s], b_base, k, s * POW_BK, chunk);
         }
+#if POW_MBARRIER_RING
+        pow_cp_async_mbar_arrive(pow_mbar_addr(&pow_mbar_full[s]));
+#else
         pow_cp_async_fence();
+#endif
     }
+
+#if POW_MBARRIER_RING
+    // Per-thread phase counters: each barrier flips parity every time it completes, and a waiter
+    // tracks which phase it is waiting on. They start at 0 because the pre-cleared EMPTY gates and
+    // the first FULL completion are both phase 0.
+    unsigned int ph_f[POW_STAGES], ph_e[POW_STAGES];
+    #pragma unroll
+    for (int s = 0; s < POW_STAGES; ++s) {
+        ph_f[s] = 0u;
+        ph_e[s] = 0u;
+    }
+#endif
 
     for (int step = 0; step < total_steps; ++step) {
         // `cp.async.wait_group` takes an immediate count of groups still allowed to be in flight.
@@ -1069,13 +1221,30 @@ extern "C" __global__ __launch_bounds__(POW_THREADS, POW_MIN_BLOCKS) void tokenm
         // serialises the copy against the multiply, because the group being waited on is the very one
         // just issued for the next step. At S == 1 it is -1, an illegal immediate that makes every
         // launch fail, so the count is clamped rather than left to underflow.
+        const int next = step + POW_STAGES - 1;
+        const int write_stage = (step + POW_STAGES - 1) % POW_STAGES;
+        const int rd = step % POW_STAGES;
+
+#if POW_MBARRIER_RING
+        // Producer gate: do not overwrite a stage a consumer may still be reading. Its previous use
+        // was `step - 1`, so this waits for every fold warp to have arrived EMPTY for it.
+        if (next < total_steps) {
+            pow_mbar_wait(pow_mbar_addr(&pow_mbar_empty[write_stage]), ph_e[write_stage]);
+            ph_e[write_stage] ^= 1u;
+        }
+#else
+        // `cp.async.wait_group` takes an immediate count of groups still allowed to be in flight.
+        // With S stages the newest commit is for the *next* step, so S-1 may remain outstanding and
+        // the wait is for `S - 2`. At S == 2 that is 0 -- wait for everything -- which is correct but
+        // serialises the copy against the multiply, because the group being waited on is the very one
+        // just issued for the next step. At S == 1 it is -1, an illegal immediate that makes every
+        // launch fail, so the count is clamped rather than left to underflow.
         pow_cp_async_wait<(POW_STAGES > 2) ? (POW_STAGES - 2) : 0>();
         __syncthreads();
+#endif
 
         // Issued before the multiply so the copy overlaps it, and fenced after: the group has to be
         // committed even on the last step, or the wait above is waiting on the wrong count.
-        const int next = step + POW_STAGES - 1;
-        const int write_stage = (step + POW_STAGES - 1) % POW_STAGES;
         if (next < total_steps) {
             for (int chunk = tid; chunk < rows_valid * 16 * (POW_BK / 16); chunk += POW_THREADS) {
                 pow_stage_copy(sA[write_stage], a_base, k, next * POW_BK, chunk);
@@ -1084,9 +1253,17 @@ extern "C" __global__ __launch_bounds__(POW_THREADS, POW_MIN_BLOCKS) void tokenm
                 pow_stage_copy(sB[write_stage], b_base, k, next * POW_BK, chunk);
             }
         }
+#if POW_MBARRIER_RING
+        pow_cp_async_mbar_arrive(pow_mbar_addr(&pow_mbar_full[write_stage]));
+        // Consumer gate: read only once every producer's copies for this stage have landed. A fast
+        // warp passes this early when the stage was filled a full ring ago -- that is the drift the
+        // barrier could not give.
+        pow_mbar_wait(pow_mbar_addr(&pow_mbar_full[rd]), ph_f[rd]);
+        ph_f[rd] ^= 1u;
+#else
         pow_cp_async_fence();
+#endif
 
-        const int rd = step % POW_STAGES;
 
         // One warp per tile row, and each warp holds that row's sixteen columns. The row's A operand
         // is loaded once and reused across all `POW_BLOCK_COLS` of them, which is what the columns
@@ -1218,6 +1395,15 @@ const unsigned int prev = POW_ST_AT(warp, t, slot);
             }
             __syncwarp();
         }
+
+#if POW_MBARRIER_RING
+        // This warp has finished reading stage `rd` -- every `ldmatrix` it needed is done -- so the
+        // producer may overwrite it. Arriving after the readout seam, not before, is what lets a fast
+        // warp run a stage ahead of a slow one.
+        if (lane == 0) {
+            pow_mbar_arrive(pow_mbar_addr(&pow_mbar_empty[rd]));
+        }
+#endif
     }
 
     __syncthreads();
@@ -1228,12 +1414,27 @@ const unsigned int prev = POW_ST_AT(warp, t, slot);
     // without a tile. `lane / 4` and not `tid / 4`: the tile row is already `warp`, so a block-wide
     // division hands warp 1 the tile columns eight to fifteen, and every warp past the first hashes
     // nothing that clears `cols_valid`.
-    const int tile_in_warp = lane / 4;
-    const bool hash_here = (lane < POW_BLOCK_COLS * 4) && (warp < rows_valid)
-                        && (tile_in_warp < cols_valid);
-
+    // Four lanes per tile: each reads all sixteen transcript words, so every lane hashes a whole
+    // transcript and no lane sits idle while another waits on a reduction. That makes a warp's tile
+    // columns `lane / 4` -- eight per pass. `POW_BLOCK_COLS` is twelve, so the pass has to repeat.
+    //
+    // **It did not, and that was a live bug.** `lane / 4` reaches 7 at most, so tile columns 8-11 of
+    // every warp were folded, their transcripts written into `sT`, and then never hashed and never
+    // claimed: a quarter of the block's work produced no share. The old guard `lane < POW_BLOCK_COLS *
+    // 4` reads as if it covered all twelve columns, but with 32 lanes it is always true, so the
+    // shortfall could not be seen from the guard itself -- only from a grid wider than eight tile
+    // columns, which is what `check_grid_against_reference` now uses.
+    //
+    // `lane / 4` and not `tid / 4`: the tile row is already `warp`, so a block-wide division hands warp
+    // 1 the tile columns eight to fifteen, and every warp past the first hashes nothing that clears
+    // `cols_valid`.
     unsigned int words[16];
-    if (hash_here) {
+    if (warp < rows_valid) {
+    // Eight tiles per pass: four lanes share a tile, and a warp has 32 lanes. `POW_THREADS / 4` would be
+    // 128, which is the block's lane count divided by four -- a stride that runs exactly one pass and
+    // leaves the columns past `lane / 4` unhashed.
+    for (int tile_in_warp = lane / 4; tile_in_warp < POW_BLOCK_COLS; tile_in_warp += 8) {
+    if (tile_in_warp >= cols_valid) break;
         // POW_SKIP_HASH is a benchmark-only ablation: it removes the per-tile BLAKE3 and the
         // bound compare so the harness can price the hash against the fold. Never defined in the
         // shipped build, so this is the production path.
@@ -1319,6 +1520,7 @@ const unsigned int prev = POW_ST_AT(warp, t, slot);
             }
         }
     }
+    }
 
     if (transcript_out != nullptr) {
         // Written unconditionally, including for the tiles the rectangle does not cover: a tile
@@ -1333,6 +1535,320 @@ const unsigned int prev = POW_ST_AT(warp, t, slot);
             unsigned int value = 0u;
             if (w < rows_valid && t < cols_valid) {
                 value = POW_ST_AT(w, t, word);
+            }
+            transcript_out[block_base * POW_TRANSCRIPT_WORDS + i] = value;
+        }
+    }
+}
+
+// ---- The wide geometry (harvest idea 2), and its B-direct variant (idea 3). ----
+//
+// Both are separate entry points rather than switches on the shipped kernel, because the thing they
+// change is the block itself: 256 threads instead of 512, and a warp owning a 64x64 tile instead of a
+// 16x16 one. The host launches whichever it was built for; `pow_smem_stride` and the grid derivation
+// have to mirror the geometry named here, exactly as they already mirror `POW_BK`.
+//
+// The reason to try it is the register cap. A 256-thread block lets ptxas use 255 registers a lane
+// instead of 128, and the accumulator is what the cap is spent on: a warp holding a 64x64 tile -- four
+// tile-rows by eight tile-columns, the same 16x16 tiles the shipped kernel uses -- spends 128 registers
+// on it, which is exactly the cap the shipped 512-thread block is pinned to. The second half of the
+// claim is the load ratio, and it is the half that actually changes with the warp tile: four `ldmatrix`
+// for A and eight for B against thirty-two multiplies, twelve per thirty-two, against the shipped
+// rectangle's thirteen for twenty-four. A smaller warp tile makes the ratio *worse*, which is why the
+// tile here is 64x64 and not something tidier. Their measured +3.0% was on Ada; the mechanism is
+// arch-neutral, the number is not.
+//
+// Warp `w` is row slot `w / 2` and column slot `w % 2`. The two warps of a row slot read the same A
+// rows and the four warps of a column slot read the same B rows, so staging is per slot and each slot
+// meets at its own named barrier: the row slots' seams need not line up, which is the drift the
+// shipped kernel's single `__syncthreads` cannot give. That is the same mechanism as
+// `POW_MBARRIER_RING`, expressed as named barriers because the wide geometry has the warp groups to
+// key them on.
+//
+// **Gated on the tensor path.** The whole geometry is built on `mma` and `ldmatrix`, so on Turing --
+// where `POW_DP4A` is 1 and `POW_LDMATRIX` is 0 -- these entry points do not exist in the cubin at
+// all. The host mirrors that: `check_search_grid_wide` returns early on an architecture below 800
+// rather than looking up an entry point that was never compiled.
+#if !POW_DP4A && POW_LDMATRIX
+#define POW_W_WARPS 8
+#define POW_W_THREADS 256
+#define POW_W_ROW_SLOTS 4
+#define POW_W_COL_SLOTS 2
+#define POW_W_ROW_TILES 4
+#define POW_W_COL_TILES 8
+#define POW_W_BLOCK_ROWS (POW_W_ROW_SLOTS * POW_W_ROW_TILES)          // 16 tile-rows
+#define POW_W_BLOCK_COLS (POW_W_COL_SLOTS * POW_W_COL_TILES)          // 16 tile-cols
+#define POW_W_TILES_PER_BLOCK (POW_W_BLOCK_ROWS * POW_W_BLOCK_COLS)   // 256
+#define POW_W_TILES_PER_WARP (POW_W_ROW_TILES * POW_W_COL_TILES)      // 32
+#define POW_W_ROW_SLOT_THREADS (POW_W_COL_SLOTS * 32)                 // 64
+#define POW_W_COL_SLOT_THREADS (POW_W_ROW_SLOTS * 32)                 // 128
+#define POW_W_SMEM_A_BYTES (POW_STAGES * POW_W_ROW_SLOTS * (POW_W_ROW_TILES * 16) * POW_SMEM_STRIDE)
+#define POW_W_SMEM_B_BYTES (POW_STAGES * POW_W_COL_SLOTS * (POW_W_COL_TILES * 16) * POW_SMEM_STRIDE)
+#define POW_W_SMEM_T_BYTES (POW_W_WARPS * POW_W_TILES_PER_WARP * POW_TRANSCRIPT_WORDS * 4)
+
+__device__ __forceinline__ void pow_bar_sync(unsigned int id, unsigned int count) {
+    asm volatile("bar.sync %0, %1;\n" :: "r"(id), "r"(count));
+}
+
+extern "C" __global__ __launch_bounds__(POW_W_THREADS) void tokenminer_search_grid_wide(
+        const signed char* a_sum,
+        const signed char* b_sum,
+        const unsigned int* key_words,
+        const unsigned int* bound,
+        unsigned int* found,
+        unsigned int* coord,
+        unsigned int* transcript_out,
+        unsigned int first_tile,
+        unsigned int tiles,
+        unsigned int tiles_per_row,
+        unsigned int tiles_per_region,
+        int k,
+        int rank) {
+    signed char* const smem = pow_dynamic_smem;
+    typedef signed char pow_w_a_stage_t[POW_W_ROW_SLOTS * (POW_W_ROW_TILES * 16) * POW_SMEM_STRIDE];
+    typedef signed char pow_w_b_stage_t[POW_W_COL_SLOTS * (POW_W_COL_TILES * 16) * POW_SMEM_STRIDE];
+    pow_w_a_stage_t* const sA = reinterpret_cast<pow_w_a_stage_t*>(smem);
+    pow_w_b_stage_t* const sB = reinterpret_cast<pow_w_b_stage_t*>(smem + POW_W_SMEM_A_BYTES);
+    unsigned int* const sT =
+        reinterpret_cast<unsigned int*>(smem + POW_W_SMEM_A_BYTES + POW_W_SMEM_B_BYTES);
+#define POW_W_ST_AT(w, t, d) sT[((w) * POW_W_TILES_PER_WARP + (t)) * POW_TRANSCRIPT_WORDS + (d)]
+
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int rs = warp >> 1;
+    const int cs = warp & 1;
+
+    const unsigned int first_row = first_tile / tiles_per_row;
+    const unsigned int rows_in_batch = tiles / tiles_per_row;
+    const unsigned int cols_per_strip = (tiles_per_row + POW_W_BLOCK_COLS - 1) / POW_W_BLOCK_COLS;
+
+    unsigned int strip, col_block;
+#if POW_L2_GROUP > 1
+    const unsigned int strips_in_batch = rows_in_batch / POW_W_BLOCK_ROWS;
+    const unsigned int groups_per_batch = (strips_in_batch + POW_L2_GROUP - 1) / POW_L2_GROUP;
+    if (groups_per_batch > 0) {
+        const unsigned int group = blockIdx.x / (POW_L2_GROUP * cols_per_strip);
+        const unsigned int within = blockIdx.x - group * (POW_L2_GROUP * cols_per_strip);
+        const unsigned int g_strip = within / cols_per_strip;
+        col_block = within - g_strip * cols_per_strip;
+#if POW_SERPENTINE
+        if (group & 1) {
+            col_block = cols_per_strip - 1 - col_block;
+        }
+#endif
+        strip = group * POW_L2_GROUP + g_strip;
+    } else {
+        strip = blockIdx.x / cols_per_strip;
+        col_block = blockIdx.x - strip * cols_per_strip;
+    }
+#else
+    strip = blockIdx.x / cols_per_strip;
+    col_block = blockIdx.x - strip * cols_per_strip;
+#endif
+
+    const unsigned int row0 = first_row + strip * POW_W_BLOCK_ROWS;
+    const unsigned int col0 = col_block * POW_W_BLOCK_COLS;
+
+    const int rows_valid = (int)min((unsigned int)POW_W_BLOCK_ROWS,
+                                    rows_in_batch - strip * POW_W_BLOCK_ROWS);
+    const int cols_valid = (int)min((unsigned int)POW_W_BLOCK_COLS, tiles_per_row - col0);
+
+    const unsigned int strip_first = strip * POW_W_BLOCK_ROWS * tiles_per_row;
+    const bool one_region = strip_first / tiles_per_region
+                         == (strip_first + POW_W_BLOCK_ROWS * tiles_per_row - 1) / tiles_per_region;
+    if (one_region && atomicAdd(found + strip_first / tiles_per_region, 0u) != 0u) {
+        return;
+    }
+
+    const signed char* a_base = a_sum + (long long)row0 * 16 * k;
+    const signed char* b_base = b_sum + (long long)col0 * 16 * k;
+
+    for (int i = tid; i < POW_W_WARPS * POW_W_TILES_PER_WARP * POW_TRANSCRIPT_WORDS; i += POW_W_THREADS) {
+        const int w = i / (POW_W_TILES_PER_WARP * POW_TRANSCRIPT_WORDS);
+        const int rest = i - w * POW_W_TILES_PER_WARP * POW_TRANSCRIPT_WORDS;
+        const int t = rest / POW_TRANSCRIPT_WORDS;
+        const int word = rest - t * POW_TRANSCRIPT_WORDS;
+        POW_W_ST_AT(w, t, word) = 0u;
+    }
+    __syncthreads();
+
+    // One hundred and twenty-eight registers of accumulator, which is the whole point of the geometry:
+    // four tile-rows by eight tile-columns, each tile two eight-column halves.
+    unsigned int acc[POW_W_ROW_TILES][POW_W_COL_TILES][2][4];
+    #pragma unroll
+    for (int rt = 0; rt < POW_W_ROW_TILES; ++rt) {
+        #pragma unroll
+        for (int t = 0; t < POW_W_COL_TILES; ++t) {
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    acc[rt][t][h][r] = 0u;
+                }
+            }
+        }
+    }
+
+    const int steps_per_rank = rank / POW_BK;
+    const int total_steps = k / POW_BK;
+
+    // Per-slot staging: this warp stages its row slot's A rows and its column slot's B rows, and the
+    // slot's own named barrier is the only ordering needed -- the other slots' seams run independently.
+    //
+    // `chunk` is a chunk *within the slot*, which is what `pow_stage_copy` reads it as, so the source
+    // pointer has to carry the slot's rows too. The walk is over the *slot's* chunks, strided by the
+    // slot's threads and offset by this warp's position within the slot -- a plain lane-strided loop
+    // from zero would make every warp in the slot copy the same bytes and leave the rest of the slot
+    // unstaged, which is a wrong kernel that still runs.
+    const int a_rows = min(POW_W_ROW_TILES, rows_valid - rs * POW_W_ROW_TILES);
+    const int b_cols = min(POW_W_COL_TILES, cols_valid - cs * POW_W_COL_TILES);
+    const int a_chunks = a_rows * 16 * (POW_BK / 16);
+    const int b_chunks = b_cols * 16 * (POW_BK / 16);
+    const int a_start = cs * 32 + lane;   // this warp's place in its row slot
+    const int b_start = rs * 32 + lane;   // this warp's place in its column slot
+    const signed char* a_slot = a_base + (long long)rs * (POW_W_ROW_TILES * 16) * k;
+    const signed char* b_slot = b_base + (long long)cs * (POW_W_COL_TILES * 16) * k;
+
+    for (int s = 0; s < POW_STAGES - 1; ++s) {
+        for (int chunk = a_start; chunk < a_chunks; chunk += POW_W_ROW_SLOT_THREADS) {
+            pow_stage_copy(sA[s] + rs * (POW_W_ROW_TILES * 16) * POW_SMEM_STRIDE, a_slot, k,
+                           s * POW_BK, chunk);
+        }
+        for (int chunk = b_start; chunk < b_chunks; chunk += POW_W_COL_SLOT_THREADS) {
+            pow_stage_copy(sB[s] + cs * (POW_W_COL_TILES * 16) * POW_SMEM_STRIDE, b_slot, k,
+                           s * POW_BK, chunk);
+        }
+        pow_cp_async_fence();
+    }
+
+    for (int step = 0; step < total_steps; ++step) {
+        pow_cp_async_wait<(POW_STAGES > 2) ? (POW_STAGES - 2) : 0>();
+        // Ids 1-4 are the row slots and 5-6 the column slots; id 0 is what `__syncthreads` uses, so the
+        // two groups never meet each other, and a thread arriving at its row barrier while another waits
+        // at its column barrier is not a cycle -- each barrier only ever waits on its own group.
+        pow_bar_sync(1u + (unsigned int)rs, POW_W_ROW_SLOT_THREADS);
+        pow_bar_sync(5u + (unsigned int)cs, POW_W_COL_SLOT_THREADS);
+
+        const int next = step + POW_STAGES - 1;
+        const int write_stage = (step + POW_STAGES - 1) % POW_STAGES;
+        if (next < total_steps) {
+            for (int chunk = a_start; chunk < a_chunks; chunk += POW_W_ROW_SLOT_THREADS) {
+                pow_stage_copy(sA[write_stage] + rs * (POW_W_ROW_TILES * 16) * POW_SMEM_STRIDE,
+                               a_slot, k, next * POW_BK, chunk);
+            }
+            for (int chunk = b_start; chunk < b_chunks; chunk += POW_W_COL_SLOT_THREADS) {
+                pow_stage_copy(sB[write_stage] + cs * (POW_W_COL_TILES * 16) * POW_SMEM_STRIDE,
+                               b_slot, k, next * POW_BK, chunk);
+            }
+        }
+        pow_cp_async_fence();
+
+        const int rd = step % POW_STAGES;
+
+        // Twelve `ldmatrix` for thirty-two `mma`: four for this warp's row tiles, eight for its column
+        // tiles. Both operand pointers are tile starts, which is what `pow_ldmatrix_x4` assumes when it
+        // keys the swizzle off `row & 7` -- a slot base is a whole number of sixteen-row tiles, so the
+        // key it computes is the same one the staging store used for the absolute row.
+        #pragma unroll
+        for (int kb = 0; kb < POW_BK / 32; ++kb) {
+            unsigned int a[4];
+            #pragma unroll
+            for (int rt = 0; rt < POW_W_ROW_TILES; ++rt) {
+                pow_ldmatrix_x4(a,
+                                sA[rd] + (rs * POW_W_ROW_TILES + rt) * 16 * POW_SMEM_STRIDE + kb * 32,
+                                lane);
+                #pragma unroll
+                for (int ct = 0; ct < POW_W_COL_TILES; ++ct) {
+                    unsigned int b[4];
+                    pow_ldmatrix_x4(b,
+                                    sB[rd] + (cs * POW_W_COL_TILES + ct) * 16 * POW_SMEM_STRIDE + kb * 32,
+                                    lane);
+                    pow_mma(acc[rt][ct][0], a[0], a[1], a[2], a[3], b[0], b[2]);
+                    pow_mma(acc[rt][ct][1], a[0], a[1], a[2], a[3], b[1], b[3]);
+                }
+            }
+        }
+
+        if ((step + 1) % steps_per_rank == 0) {
+            const int slot = (step / steps_per_rank) % POW_TRANSCRIPT_WORDS;
+            #pragma unroll
+            for (int tile = 0; tile < POW_W_TILES_PER_WARP; ++tile) {
+                const int rt = tile / POW_W_COL_TILES;
+                const int ct = tile % POW_W_COL_TILES;
+                unsigned int x = 0u;
+                if (rs * POW_W_ROW_TILES + rt < rows_valid) {
+                    #pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        x ^= acc[rt][ct][h][0] ^ acc[rt][ct][h][1]
+                           ^ acc[rt][ct][h][2] ^ acc[rt][ct][h][3];
+                    }
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    x ^= __shfl_xor_sync(0xffffffffu, x, off);
+                }
+                if (lane == 0) {
+                    const unsigned int prev = POW_W_ST_AT(warp, tile, slot);
+                    POW_W_ST_AT(warp, tile, slot) =
+                        ((prev << POW_HASH_ROT) | (prev >> (32 - POW_HASH_ROT))) ^ x;
+                }
+            }
+            __syncwarp();
+        }
+    }
+
+    __syncthreads();
+
+    // Four lanes per tile, exactly as the shipped kernel does it -- every lane hashes a whole
+    // transcript, so no lane idles while another waits on a reduction. Thirty-two tiles at four lanes
+    // each is eight passes a lane, `lane / 4` being the first and the stride being the warp count.
+    unsigned int words[16];
+    for (int tile_in_warp = lane / 4; tile_in_warp < POW_W_TILES_PER_WARP; tile_in_warp += POW_W_WARPS) {
+        const int rt = tile_in_warp / POW_W_COL_TILES;
+        const int ct = tile_in_warp % POW_W_COL_TILES;
+        if (rs * POW_W_ROW_TILES + rt >= rows_valid || cs * POW_W_COL_TILES + ct >= cols_valid) {
+            continue;
+        }
+#if defined(POW_SKIP_HASH)
+        if (key_words[0] == 0xffffffffu) { words[0] = 1u; }
+#else
+        b3_chunk_cv(reinterpret_cast<const unsigned char*>(&POW_W_ST_AT(warp, tile_in_warp, 0)), 64u,
+                    0ull, key_words, B3_KEYED_HASH, B3_ROOT, words);
+#endif
+        bool under = true;
+        for (int i = 0; i < 8; ++i) {
+            const unsigned int have = words[7 - i];
+            const unsigned int want = bound[i];
+            if (have > want) { under = false; break; }
+            if (have < want) { break; }
+        }
+        if (under) {
+            const unsigned int tr = row0 + (unsigned int)(rs * POW_W_ROW_TILES + rt);
+            const unsigned int tc = col0 + (unsigned int)(cs * POW_W_COL_TILES + ct);
+            const unsigned int region = (tr * tiles_per_row + tc - first_tile) / tiles_per_region;
+            if (atomicCAS(found + region, 0u, 1u) == 0u) {
+                coord[region * 2]     = tr;
+                coord[region * 2 + 1] = tc;
+            }
+        }
+    }
+
+    if (transcript_out != nullptr) {
+        const unsigned int block_base = blockIdx.x * POW_W_TILES_PER_BLOCK;
+        for (int i = tid; i < POW_W_TILES_PER_BLOCK * POW_TRANSCRIPT_WORDS; i += POW_W_THREADS) {
+            const int w = i / (POW_W_TILES_PER_WARP * POW_TRANSCRIPT_WORDS);
+            const int rest = i - w * POW_W_TILES_PER_WARP * POW_TRANSCRIPT_WORDS;
+            const int t = rest / POW_TRANSCRIPT_WORDS;
+            const int word = rest - t * POW_TRANSCRIPT_WORDS;
+            unsigned int value = 0u;
+            if (w < POW_W_WARPS) {
+                const int wr = w / POW_W_COL_SLOTS;
+                const int wc = w % POW_W_COL_SLOTS;
+                if (wr * POW_W_ROW_TILES + t / POW_W_COL_TILES < rows_valid
+                    && wc * POW_W_COL_TILES + t % POW_W_COL_TILES < cols_valid) {
+                    value = POW_W_ST_AT(w, t, word);
+                }
             }
             transcript_out[block_base * POW_TRANSCRIPT_WORDS + i] = value;
         }
@@ -1380,3 +1896,334 @@ extern "C" __global__ void tokenminer_noise_apply(
         out[i] = (signed char)sum;
     }
 }
+
+// ---- B-direct fold (harvest idea 3): the wide geometry with B kept in registers. ----
+//
+// B never passes through shared memory. The host writes it once, in the order `ldmatrix` would have
+// handed it to each lane, and the warp keeps it in registers: `LDG.128` for the next k-block while the
+// current one is being multiplied. This attacks the traffic term from the operand side -- staging is
+// what the profile says the kernel waits on -- but it costs registers, which is the resource this
+// geometry is already spending: 128 for the accumulator plus 64 for two fragment buffers, against the
+// wide kernel's 128 plus eight.
+//
+// Two things to know before reading any number this produces:
+//
+// * The fragment order is not the tile order. `pow_ldmatrix_x4` hands lane `l` the four bytes at
+//   `(l & 3) * 4` of each of four matrices, so a lane's sixteen bytes come from four different rows of
+//   the tile. The writer kernel below lays them out exactly as the loader would have produced them,
+//   which is what lets the fold read them straight from registers. A host that writes B row-major into
+//   this buffer produces a kernel that runs, computes something, and is wrong.
+// * Warps that share a column slot read the same B rows, so here each lane's load is duplicated across
+//   the four warps of its slot. The traffic is not saved; it is moved from shared to global and paid
+//   for twice. That is the difference from the reference, whose warp tiles do not share.
+//
+// The column-slot named barrier is gone: with B in registers there is nothing for the four warps of a
+// slot to order against, so only the row slots still meet.
+// `POW_B_KB` is k-blocks *per stage*; a k-block is the `mma` instruction's own k, which is 32 bytes.
+// The two are not the same number and the fragment buffer is sized by the second one.
+#define POW_B_KB (POW_BK / 32)
+#define POW_KB_BYTES 32
+
+__device__ __forceinline__ void pow_ldg_frag(unsigned int* out, const unsigned char* p) {
+    asm volatile("ld.global.nc.v4.b32 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3])
+                 : "l"(p));
+}
+
+extern "C" __global__ __launch_bounds__(POW_W_THREADS) void tokenminer_search_grid_wide_bdirect(
+        const signed char* a_sum,
+        const unsigned char* b_frag,           // [tile][k / POW_KB_BYTES][lane][16], as the loader would have made it
+        const unsigned int* key_words,
+        const unsigned int* bound,
+        unsigned int* found,
+        unsigned int* coord,
+        unsigned int* transcript_out,
+        unsigned int first_tile,
+        unsigned int tiles,
+        unsigned int tiles_per_row,
+        unsigned int tiles_per_region,
+        int k,
+        int rank) {
+    signed char* const smem = pow_dynamic_smem;
+    typedef signed char pow_w_a_stage_t[POW_W_ROW_SLOTS * (POW_W_ROW_TILES * 16) * POW_SMEM_STRIDE];
+    pow_w_a_stage_t* const sA = reinterpret_cast<pow_w_a_stage_t*>(smem);
+    unsigned int* const sT = reinterpret_cast<unsigned int*>(smem + POW_W_SMEM_A_BYTES);
+#define POW_BD_ST_AT(w, t, d) sT[((w) * POW_W_TILES_PER_WARP + (t)) * POW_TRANSCRIPT_WORDS + (d)]
+
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int rs = warp >> 1;
+    const int cs = warp & 1;
+
+    const unsigned int first_row = first_tile / tiles_per_row;
+    const unsigned int rows_in_batch = tiles / tiles_per_row;
+    const unsigned int cols_per_strip = (tiles_per_row + POW_W_BLOCK_COLS - 1) / POW_W_BLOCK_COLS;
+
+    unsigned int strip, col_block;
+#if POW_L2_GROUP > 1
+    const unsigned int strips_in_batch = rows_in_batch / POW_W_BLOCK_ROWS;
+    const unsigned int groups_per_batch = (strips_in_batch + POW_L2_GROUP - 1) / POW_L2_GROUP;
+    if (groups_per_batch > 0) {
+        const unsigned int group = blockIdx.x / (POW_L2_GROUP * cols_per_strip);
+        const unsigned int within = blockIdx.x - group * (POW_L2_GROUP * cols_per_strip);
+        const unsigned int g_strip = within / cols_per_strip;
+        col_block = within - g_strip * cols_per_strip;
+#if POW_SERPENTINE
+        if (group & 1) {
+            col_block = cols_per_strip - 1 - col_block;
+        }
+#endif
+        strip = group * POW_L2_GROUP + g_strip;
+    } else {
+        strip = blockIdx.x / cols_per_strip;
+        col_block = blockIdx.x - strip * cols_per_strip;
+    }
+#else
+    strip = blockIdx.x / cols_per_strip;
+    col_block = blockIdx.x - strip * cols_per_strip;
+#endif
+
+    const unsigned int row0 = first_row + strip * POW_W_BLOCK_ROWS;
+    const unsigned int col0 = col_block * POW_W_BLOCK_COLS;
+
+    const int rows_valid = (int)min((unsigned int)POW_W_BLOCK_ROWS,
+                                    rows_in_batch - strip * POW_W_BLOCK_ROWS);
+    const int cols_valid = (int)min((unsigned int)POW_W_BLOCK_COLS, tiles_per_row - col0);
+
+    const unsigned int strip_first = strip * POW_W_BLOCK_ROWS * tiles_per_row;
+    const bool one_region = strip_first / tiles_per_region
+                         == (strip_first + POW_W_BLOCK_ROWS * tiles_per_row - 1) / tiles_per_region;
+    if (one_region && atomicAdd(found + strip_first / tiles_per_region, 0u) != 0u) {
+        return;
+    }
+
+    const signed char* a_base = a_sum + (long long)row0 * 16 * k;
+    const signed char* a_slot = a_base + (long long)rs * (POW_W_ROW_TILES * 16) * k;
+
+    for (int i = tid; i < POW_W_WARPS * POW_W_TILES_PER_WARP * POW_TRANSCRIPT_WORDS; i += POW_W_THREADS) {
+        const int w = i / (POW_W_TILES_PER_WARP * POW_TRANSCRIPT_WORDS);
+        const int rest = i - w * POW_W_TILES_PER_WARP * POW_TRANSCRIPT_WORDS;
+        const int t = rest / POW_TRANSCRIPT_WORDS;
+        POW_BD_ST_AT(w, t, rest - t * POW_TRANSCRIPT_WORDS) = 0u;
+    }
+    __syncthreads();
+
+    unsigned int acc[POW_W_ROW_TILES][POW_W_COL_TILES][2][4];
+    #pragma unroll
+    for (int rt = 0; rt < POW_W_ROW_TILES; ++rt) {
+        #pragma unroll
+        for (int t = 0; t < POW_W_COL_TILES; ++t) {
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    acc[rt][t][h][r] = 0u;
+                }
+            }
+        }
+    }
+
+    const int steps_per_rank = rank / POW_BK;
+    const int total_steps = k / POW_BK;
+    const int kb_total = k / POW_KB_BYTES;   // global k-blocks, i.e. fragment-buffer entries per tile
+
+    unsigned int bcur[POW_W_COL_TILES][4];
+    unsigned int bnext[POW_W_COL_TILES][4];
+
+    const int a_rows = min(POW_W_ROW_TILES, rows_valid - rs * POW_W_ROW_TILES);
+    const int a_chunks = a_rows * 16 * (POW_BK / 16);
+    const int a_start = cs * 32 + lane;   // this warp's place in its row slot
+
+    for (int ct = 0; ct < POW_W_COL_TILES; ++ct) {
+        if (cs * POW_W_COL_TILES + ct < cols_valid) {
+            pow_ldg_frag(bcur[ct], b_frag + (((long long)(col0 + cs * POW_W_COL_TILES + ct) * kb_total)
+                                             * 32 + lane) * 16);
+        }
+    }
+
+    for (int s = 0; s < POW_STAGES - 1; ++s) {
+        for (int chunk = a_start; chunk < a_chunks; chunk += POW_W_ROW_SLOT_THREADS) {
+            pow_stage_copy(sA[s] + rs * (POW_W_ROW_TILES * 16) * POW_SMEM_STRIDE, a_slot, k,
+                           s * POW_BK, chunk);
+        }
+        pow_cp_async_fence();
+    }
+
+    for (int step = 0; step < total_steps; ++step) {
+        pow_cp_async_wait<(POW_STAGES > 2) ? (POW_STAGES - 2) : 0>();
+        pow_bar_sync(1u + (unsigned int)rs, POW_W_ROW_SLOT_THREADS);
+
+        const int next = step + POW_STAGES - 1;
+        const int write_stage = (step + POW_STAGES - 1) % POW_STAGES;
+        if (next < total_steps) {
+            for (int chunk = a_start; chunk < a_chunks; chunk += POW_W_ROW_SLOT_THREADS) {
+                pow_stage_copy(sA[write_stage] + rs * (POW_W_ROW_TILES * 16) * POW_SMEM_STRIDE,
+                               a_slot, k, next * POW_BK, chunk);
+            }
+        }
+        pow_cp_async_fence();
+
+        const int rd = step % POW_STAGES;
+
+        #pragma unroll
+        for (int kb = 0; kb < POW_B_KB; ++kb) {
+            const int g = step * POW_B_KB + kb;
+            // Issue the next k-block before the multiply, so its latency is hidden by the fold; the
+            // copy that promotes it happens after, which is the one k-step of look-ahead the idea is.
+            if (g + 1 < kb_total) {
+                #pragma unroll
+                for (int ct = 0; ct < POW_W_COL_TILES; ++ct) {
+                    if (cs * POW_W_COL_TILES + ct < cols_valid) {
+                        pow_ldg_frag(bnext[ct],
+                                     b_frag + (((long long)(col0 + cs * POW_W_COL_TILES + ct) * kb_total
+                                                + g + 1) * 32 + lane) * 16);
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int rt = 0; rt < POW_W_ROW_TILES; ++rt) {
+                unsigned int a[4];
+                pow_ldmatrix_x4(a,
+                                sA[rd] + (rs * POW_W_ROW_TILES + rt) * 16 * POW_SMEM_STRIDE + kb * 32,
+                                lane);
+                #pragma unroll
+                for (int ct = 0; ct < POW_W_COL_TILES; ++ct) {
+                    pow_mma(acc[rt][ct][0], a[0], a[1], a[2], a[3], bcur[ct][0], bcur[ct][2]);
+                    pow_mma(acc[rt][ct][1], a[0], a[1], a[2], a[3], bcur[ct][1], bcur[ct][3]);
+                }
+            }
+
+            #pragma unroll
+            for (int ct = 0; ct < POW_W_COL_TILES; ++ct) {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    bcur[ct][i] = bnext[ct][i];
+                }
+            }
+        }
+
+        if ((step + 1) % steps_per_rank == 0) {
+            const int slot = (step / steps_per_rank) % POW_TRANSCRIPT_WORDS;
+            #pragma unroll
+            for (int tile = 0; tile < POW_W_TILES_PER_WARP; ++tile) {
+                const int rt = tile / POW_W_COL_TILES;
+                const int ct = tile % POW_W_COL_TILES;
+                unsigned int x = 0u;
+                if (rs * POW_W_ROW_TILES + rt < rows_valid) {
+                    #pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        x ^= acc[rt][ct][h][0] ^ acc[rt][ct][h][1]
+                           ^ acc[rt][ct][h][2] ^ acc[rt][ct][h][3];
+                    }
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    x ^= __shfl_xor_sync(0xffffffffu, x, off);
+                }
+                if (lane == 0) {
+                    const unsigned int prev = POW_BD_ST_AT(warp, tile, slot);
+                    POW_BD_ST_AT(warp, tile, slot) =
+                        ((prev << POW_HASH_ROT) | (prev >> (32 - POW_HASH_ROT))) ^ x;
+                }
+            }
+            __syncwarp();
+        }
+    }
+
+    __syncthreads();
+
+    unsigned int words[16];
+    for (int tile_in_warp = lane / 4; tile_in_warp < POW_W_TILES_PER_WARP; tile_in_warp += POW_W_WARPS) {
+        const int rt = tile_in_warp / POW_W_COL_TILES;
+        const int ct = tile_in_warp % POW_W_COL_TILES;
+        if (rs * POW_W_ROW_TILES + rt >= rows_valid || cs * POW_W_COL_TILES + ct >= cols_valid) {
+            continue;
+        }
+#if defined(POW_SKIP_HASH)
+        if (key_words[0] == 0xffffffffu) { words[0] = 1u; }
+#else
+        b3_chunk_cv(reinterpret_cast<const unsigned char*>(&POW_BD_ST_AT(warp, tile_in_warp, 0)), 64u,
+                    0ull, key_words, B3_KEYED_HASH, B3_ROOT, words);
+#endif
+        bool under = true;
+        for (int i = 0; i < 8; ++i) {
+            const unsigned int have = words[7 - i];
+            const unsigned int want = bound[i];
+            if (have > want) { under = false; break; }
+            if (have < want) { break; }
+        }
+        if (under) {
+            const unsigned int tr = row0 + (unsigned int)(rs * POW_W_ROW_TILES + rt);
+            const unsigned int tc = col0 + (unsigned int)(cs * POW_W_COL_TILES + ct);
+            const unsigned int region = (tr * tiles_per_row + tc - first_tile) / tiles_per_region;
+            if (atomicCAS(found + region, 0u, 1u) == 0u) {
+                coord[region * 2]     = tr;
+                coord[region * 2 + 1] = tc;
+            }
+        }
+    }
+
+    if (transcript_out != nullptr) {
+        const unsigned int block_base = blockIdx.x * POW_W_TILES_PER_BLOCK;
+        for (int i = tid; i < POW_W_TILES_PER_BLOCK * POW_TRANSCRIPT_WORDS; i += POW_W_THREADS) {
+            const int w = i / (POW_W_TILES_PER_WARP * POW_TRANSCRIPT_WORDS);
+            const int rest = i - w * POW_W_TILES_PER_WARP * POW_TRANSCRIPT_WORDS;
+            const int t = rest / POW_TRANSCRIPT_WORDS;
+            const int word = rest - t * POW_TRANSCRIPT_WORDS;
+            unsigned int value = 0u;
+            if (w < POW_W_WARPS) {
+                const int wr = w / POW_W_COL_SLOTS;
+                const int wc = w % POW_W_COL_SLOTS;
+                if (wr * POW_W_ROW_TILES + t / POW_W_COL_TILES < rows_valid
+                    && wc * POW_W_COL_TILES + t % POW_W_COL_TILES < cols_valid) {
+                    value = POW_BD_ST_AT(w, t, word);
+                }
+            }
+            transcript_out[block_base * POW_TRANSCRIPT_WORDS + i] = value;
+        }
+    }
+}
+
+/// `b_sum` -> the fragment order `pow_ldmatrix_x4` would have produced, one 16-byte block per
+/// (tile column, k-block, lane).
+///
+/// The B-direct fold reads this buffer straight into its registers, so the layout here *is* the
+/// contract: element `i` of lane `l`'s block is the four bytes at row `(i & 1) * 8 + (l >> 2)` and byte
+/// `(i >> 1) * 16 + (l & 3) * 4` of that tile's k-block -- matrix `i` takes its row base from the low bit
+/// of `i` and its byte base from the high bit, which is the address `pow_ldmatrix_x4` builds. Written
+/// row-major instead, the search kernel still runs and still reports shares -- it just reports the wrong
+/// ones. So does a writer that swaps the two bases: the buffer has the right shape and the wrong
+/// contents, and only a check that compares contents can tell.
+///
+/// `blockIdx.x` is a **tile column**, not a linear tile: `b_sum` is `n_tiles` tile columns of sixteen
+/// rows, so the buffer is `tiles_per_row` blocks wide no matter how many tile rows the batch has. A
+/// launch that sized it by the tile count writes the same columns over and over and leaves the search
+/// reading fragments for tiles that were never written.
+extern "C" __global__ void tokenminer_b_frag_order(const signed char* b_sum,
+                                                   unsigned char* b_frag,
+                                                   int k) {
+    const unsigned int tile = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int kb_total = k / POW_KB_BYTES;
+
+    for (int kb = 0; kb < kb_total; ++kb) {
+        unsigned char* out = b_frag + (((long long)tile * kb_total + kb) * 32 + lane) * 16;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            // Matrix `i` is rows `(i & 1) * 8 .. + 7` and bytes `(i >> 1) * 16 .. + 15` -- the row base
+            // comes from the low bit of the matrix index and the byte base from its high bit, which is
+            // exactly the address `pow_ldmatrix_x4` builds from `lane` (`row = (lane & 7) + 8 * ((lane >>
+            // 3) & 1)`, `koff = (lane >> 4) * 16`). Swapping the two bases is the mistake this shape
+            // cannot show on a square tile: it still writes 16 bytes per lane, just from the wrong four
+            // rows.
+            const int row = (i & 1) * 8 + (lane >> 2);
+            const int off = kb * POW_KB_BYTES + (i >> 1) * 16 + (lane & 3) * 4;
+            const unsigned int v =
+                (unsigned int)*(const unsigned int*)(b_sum + (long long)(tile * 16 + row) * k + off);
+            *(unsigned int*)(out + i * 4) = v;
+        }
+    }
+}
+#endif // !POW_DP4A && POW_LDMATRIX

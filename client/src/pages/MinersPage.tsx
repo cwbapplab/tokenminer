@@ -89,6 +89,9 @@ export function MinersPage() {
       minerConfig: created.minerConfig,
       coinCode: created.coinCode,
       algorithmCode: created.algorithmCode,
+      // Only a fallback for a session that names neither coin. The API's coin still wins when it
+      // names one, so this cannot make a Pearl session run the Quantus engine.
+      defaultEngine: settings.defaultEngine,
       // The API's endpoint is authoritative; the local setting is only a dev fallback.
       stratumEndpoint: created.stratumEndpoint || settings.stratumEndpoint,
       quantus: settings.quantus,

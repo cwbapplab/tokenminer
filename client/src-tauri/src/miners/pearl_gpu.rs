@@ -242,7 +242,7 @@ impl GpuMiner {
                 let in_batch = (*regions_per_batch).min(tiles_per_row - first);
                 let batch_tiles = in_batch * tiles_per_row;
 
-                backend.search_grid(
+                backend.search_selected(
                     &workspace.a_sum,
                     &workspace.b_sum,
                     &jackpot_key,

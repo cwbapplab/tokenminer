@@ -1,5 +1,7 @@
 /** Persisted, non-secret application settings (miner + API configuration). */
 
+import type { MinerKind } from "./types";
+
 export interface QuantusSettings {
   nodeAddr: string;
   authTokenFile: string;
@@ -23,6 +25,13 @@ export interface AppSettings {
    * template may reference the pool's base URL instead of `{stratumHost}`.
    */
   stratumEndpoint: string;
+  /**
+   * Which engine a session starts when the API does not name one. A fallback, not an
+   * override: a session whose coin or algorithm says PRL/pearl still runs Pearl and one
+   * that says QTC/quantus still runs Quantus, whatever this is set to. It only decides the
+   * ambiguous case, which used to be hard-wired to Quantus.
+   */
+  defaultEngine: MinerKind;
   quantus: QuantusSettings;
   pearl: PearlSettings;
 }
@@ -34,6 +43,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // must match the interface holding the default route on the machine running the stack.
   apiBaseUrl: "http://192.168.1.2:5210",
   stratumEndpoint: "192.168.1.2:3333",
+  defaultEngine: "pearl",
   quantus: {
     nodeAddr: "127.0.0.1:9833",
     authTokenFile: "",
@@ -52,6 +62,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   },
 };
 
+function isMinerKind(value: unknown): value is MinerKind {
+  return value === "pearl" || value === "quantus";
+}
+
 export function loadSettings(): AppSettings {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -62,6 +76,10 @@ export function loadSettings(): AppSettings {
     return {
       ...DEFAULT_SETTINGS,
       ...parsed,
+      // A stored engine name is checked rather than trusted: an invalid one would otherwise survive
+      // the merge and fail at session start as a Rust deserialization error, which reads as a broken
+      // session rather than a bad setting.
+      defaultEngine: isMinerKind(parsed.defaultEngine) ? parsed.defaultEngine : DEFAULT_SETTINGS.defaultEngine,
       quantus: { ...DEFAULT_SETTINGS.quantus, ...parsed.quantus },
       pearl: { ...DEFAULT_SETTINGS.pearl, ...parsed.pearl },
     };

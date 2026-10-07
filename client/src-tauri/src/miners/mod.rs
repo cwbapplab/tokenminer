@@ -342,6 +342,10 @@ pub struct SessionConfig {
     pub coin_code: Option<String>,
     #[serde(default)]
     pub algorithm_code: Option<String>,
+    /// The client's engine preference, used only when the session names neither coin. A fallback,
+    /// not an override — see [`command::resolve_kind`].
+    #[serde(default)]
+    pub default_engine: Option<MinerKind>,
     /// The client's configured Stratum endpoint (the proxy), used as a fallback only.
     #[serde(default)]
     pub stratum_endpoint: Option<String>,
@@ -385,10 +389,14 @@ pub fn start_session_miner(
     }
 
     let params = command::parse(&config.command)?;
+    // `Pearl` here is the same default the frontend's settings carry, kept for a payload that does
+    // not send the field at all. The two have to agree or a session started through a path that
+    // omits it resolves differently from one started through the UI.
     let kind = command::resolve_kind(
         config.coin_code.as_deref(),
         config.algorithm_code.as_deref(),
         &params.program,
+        config.default_engine.unwrap_or(MinerKind::Pearl),
     );
 
     // The API's endpoint is authoritative (structured config, then the session field). Never fall
@@ -530,4 +538,30 @@ pub fn stop_miner(
 pub fn get_miner_status(state: State<'_, AppState>) -> Result<Vec<MinerStatus>, String> {
     let manager = state.miners.lock().map_err(|_| "miner state is poisoned")?;
     Ok(manager.statuses())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The field name is the whole contract, so this is the check that cannot be vacuous.
+    ///
+    /// `#[serde(default)]` means a misspelled key on the wire deserializes to `None`, and `None`
+    /// resolves to Pearl -- which is the same answer the default gives. A test that sent Pearl would
+    /// pass against a broken binding. Sending a preference that disagrees with the default is the only
+    /// way to tell a working `defaultEngine` from one the Rust side never reads.
+    #[test]
+    fn the_engine_preference_binds_under_its_camel_case_name() {
+        let config: SessionConfig = serde_json::from_str(
+            r#"{"command":"miner","defaultEngine":"quantus"}"#,
+        )
+        .expect("the payload the frontend sends should deserialize");
+        assert_eq!(config.default_engine, Some(MinerKind::Quantus));
+
+        // A payload from before the field existed still deserializes, which is what `serde(default)`
+        // is for.
+        let older: SessionConfig = serde_json::from_str(r#"{"command":"miner"}"#)
+            .expect("a payload without the new field should still deserialize");
+        assert_eq!(older.default_engine, None);
+    }
 }

@@ -145,7 +145,63 @@ pub struct CudaBackend {
     module: Arc<CudaModule>,
     arch: &'static str,
     device: DeviceInfo,
+    /// Which fold the search runs. See [`PowKernel`].
+    pow_kernel: PowKernel,
+    /// The B-direct fold's fragment buffer, kept across batches so it is not reallocated per launch.
+    /// Sized by the grid's *width*, not its tile count -- see [`Self::b_frag_order`].
+    frag: Option<CudaSlice<u8>>,
 }
+
+/// Which of the three entry points the search batch goes through. All three are the same fold on the
+/// same operands, so this decides geometry and operand path only -- and all three are pinned against the
+/// same reference by `check_grid_against_reference`, so a selection that changes results is a bug rather
+/// than a measurement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PowKernel {
+    Shipped,
+    Wide,
+    Bdirect,
+}
+
+impl PowKernel {
+    /// Read once at open, so a benchmark can flip the geometry without touching the source.
+    ///
+    /// An unrecognised value is not quietly the shipped kernel -- it is an error. A benchmark that read
+    /// as a new geometry while running the shipped one is the failure mode this harness exists to avoid.
+    fn from_env() -> Result<Self, String> {
+        let raw = std::env::var("TOKENMINER_POW_KERNEL").unwrap_or_default();
+        if raw.is_empty() {
+            return Ok(PowKernel::Shipped);
+        }
+        match raw.as_str() {
+            "shipped" => Ok(PowKernel::Shipped),
+            "wide" => Ok(PowKernel::Wide),
+            "bdirect" => Ok(PowKernel::Bdirect),
+            other => Err(format!(
+                "TOKENMINER_POW_KERNEL={other} is not one of shipped, wide, bdirect"
+            )),
+        }
+    }
+}
+
+/// One launch entry point, called with the arguments the reference check already knows: the operands,
+/// the key, the bound, the claim buffers, the batch offset, and the grid shape. The check itself does
+/// not care which kernel it is handed -- the operands, the priced digests and the four runs are the
+/// same for every geometry, so a new entry point is pinned by the same comparison as the shipped one.
+type GridLaunch<'a> = &'a dyn Fn(
+    &CudaSlice<i8>,
+    &CudaSlice<i8>,
+    &[u8; 32],
+    U256,
+    &mut CudaSlice<u32>,
+    &mut CudaSlice<u32>,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) -> Result<usize, String>;
 
 impl CudaBackend {
     pub fn open(ordinal: usize) -> Result<Self, String> {
@@ -192,12 +248,22 @@ impl CudaBackend {
             multiprocessors,
         };
 
+        let pow_kernel = PowKernel::from_env()?;
+        if pow_kernel != PowKernel::Shipped && arch_code(arch).is_some_and(|code| code < 800) {
+            return Err(format!(
+                "TOKENMINER_POW_KERNEL={pow_kernel:?} needs the tensor-core fold: the {arch} cubin \
+                 has no wide or B-direct entry point (they are gated on `POW_LDMATRIX`)"
+            ));
+        }
+
         Ok(Self {
             stream: ctx.default_stream(),
             _ctx: ctx,
             module,
             arch,
             device,
+            pow_kernel,
+            frag: None,
         })
     }
 
@@ -693,6 +759,12 @@ impl CudaBackend {
     /// Stages of k in flight. Mirrors `POW_STAGES`.
     #[cfg(feature = "pearl")]
     const POW_STAGES: usize = 2;
+    /// A k-block is the `mma` instruction's own k: 32 bytes. Not the same number as `pow_bk`, which is
+    /// the staged width, i.e. k-blocks *per stage*. The fragment buffer the B-direct fold reads is sized
+    /// by this one, so sizing it by `pow_bk` over-allocates by a factor of two and the kernel reads
+    /// fragments the writer never wrote. Mirrors `POW_KB_BYTES`.
+    #[cfg(feature = "pearl")]
+    const POW_KB_BYTES: usize = 32;
     #[cfg(feature = "pearl")]
     const POW_TRANSCRIPT_WORDS: usize = 16;
     #[cfg(feature = "pearl")]
@@ -703,6 +775,50 @@ impl CudaBackend {
     #[cfg(feature = "pearl")]
     const POW_SMEM_T_BYTES: usize =
         Self::POW_BLOCK_ROWS * Self::POW_BLOCK_COLS * Self::POW_TRANSCRIPT_WORDS * 4;
+
+    /// The wide geometry's block: eight warps, each owning a 64x64 tile -- four tile-rows by eight
+    /// tile-columns. Mirrors the `POW_W_*` block in `kernels/pearl.cu`, and has to be kept in step with
+    /// it because the grid derivation below is the same division the kernel performs on `blockIdx.x`.
+    #[cfg(feature = "pearl")]
+    const POW_W_WARPS: usize = 8;
+    #[cfg(feature = "pearl")]
+    const POW_W_THREADS: u32 = 256;
+    #[cfg(feature = "pearl")]
+    const POW_W_ROW_SLOTS: usize = 4;
+    #[cfg(feature = "pearl")]
+    const POW_W_COL_SLOTS: usize = 2;
+    #[cfg(feature = "pearl")]
+    const POW_W_ROW_TILES: usize = 4;
+    #[cfg(feature = "pearl")]
+    const POW_W_COL_TILES: usize = 8;
+    #[cfg(feature = "pearl")]
+    const POW_W_BLOCK_ROWS: usize = Self::POW_W_ROW_SLOTS * Self::POW_W_ROW_TILES;
+    #[cfg(feature = "pearl")]
+    const POW_W_BLOCK_COLS: usize = Self::POW_W_COL_SLOTS * Self::POW_W_COL_TILES;
+    #[cfg(feature = "pearl")]
+    const POW_W_TILES_PER_WARP: usize = Self::POW_W_ROW_TILES * Self::POW_W_COL_TILES;
+    #[cfg(feature = "pearl")]
+    const POW_W_TILES_PER_BLOCK: usize = Self::POW_W_BLOCK_ROWS * Self::POW_W_BLOCK_COLS;
+    #[cfg(feature = "pearl")]
+    const POW_W_SMEM_T_BYTES: usize =
+        Self::POW_W_WARPS * Self::POW_W_TILES_PER_WARP * Self::POW_TRANSCRIPT_WORDS * 4;
+
+    /// The wide block's dynamic shared memory: staged A per row slot, staged B per column slot, and the
+    /// transcript at the end of the same allocation. Mirrors `POW_W_SMEM_A_BYTES + POW_W_SMEM_B_BYTES +
+    /// POW_W_SMEM_T_BYTES`.
+    ///
+    /// At the shipped `POW_BK` 64 this is 86,016 bytes against the shipped geometry's 82,944 -- both
+    /// under the per-block opt-in limit, but the wide block is one warp-tile wider on the B axis, so a
+    /// `POW_STAGES` bump puts it over the line first.
+    #[cfg(feature = "pearl")]
+    fn pow_w_smem_dynamic_bytes(arch: &str) -> usize {
+        Self::POW_STAGES
+            * (Self::POW_W_ROW_SLOTS * Self::POW_W_ROW_TILES
+                + Self::POW_W_COL_SLOTS * Self::POW_W_COL_TILES)
+            * 16
+            * Self::pow_smem_stride(arch)
+            + Self::POW_W_SMEM_T_BYTES
+    }
 
     /// k staged at once, which is also the mma instruction's k. `k` and `rank` must both be multiples
     /// of it. Mirrors `POW_BK`.
@@ -777,9 +893,17 @@ impl CudaBackend {
     /// nothing pointing at this.
     #[cfg(feature = "pearl")]
     fn pow_opt_in_shared_memory(func: &CudaFunction, arch: &str) -> Result<(), String> {
+        Self::pow_opt_in_shared_memory_bytes(func, Self::pow_smem_dynamic_bytes(arch))
+    }
+
+    /// The same opt-in, for a geometry whose request is not the shipped one. The wide block asks for
+    /// [`Self::pow_w_smem_dynamic_bytes`], and the two numbers must not be kept in one function that
+    /// guesses which geometry the caller is launching.
+    #[cfg(feature = "pearl")]
+    fn pow_opt_in_shared_memory_bytes(func: &CudaFunction, want: usize) -> Result<(), String> {
         use cudarc::driver::sys::CUfunction_attribute_enum;
 
-        let want = Self::pow_smem_dynamic_bytes(arch) as i32;
+        let want = want as i32;
         func.set_attribute(
             CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             want,
@@ -792,44 +916,11 @@ impl CudaBackend {
         })
     }
 
-    /// Searches a batch of 16x16 tiles on the device: fold, hash, bound compare, and claim.
-    ///
-    /// `a_sum` is the noise-applied `A` as `m_tiles * 16` rows of `k` and `b_sum` the same for `Bt`;
-    /// the tile grid is walked linearly and cut into `tiles`/`tiles_per_row`-shaped regions, each with
-    /// its own `found` and `coord` slot. `key` is `dnsA` and `bound` is the 256-bit search bound.
-    ///
-    /// Exactly one tile per region can win, which is what the `atomicCAS` in the kernel enforces: the
-    /// rest of a region's qualifying tiles are discarded, because they would produce the same share.
-    /// A batch of regions in flight therefore cannot have one region's win overwrite another's, and
-    /// the caller can tell which region won without reading back anything but `found`.
-    ///
-    /// Returns the number of regions in the batch that were won.
-    ///
-    /// `found` is cleared before the launch, so a caller can reuse one pair of buffers across a
-    /// whole search without clearing them itself.
-    ///
-    /// `transcript_out` is `Some` only for [`Self::check_fold`], which reads every tile's transcript
-    /// back to compare against the reference fold. Production passes `None`: hashing the transcript
-    /// and comparing the digest already pins the same value, and a 512 KiB read-back per batch to
-    /// learn it a second way is not worth the PCIe round trip.
+    /// The argument checks every search entry point shares, so the wide variants cannot drift from the
+    /// shipped one on a rule the kernel depends on.
     #[cfg(feature = "pearl")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_grid(
-        &self,
-        a_sum: &CudaSlice<i8>,
-        b_sum: &CudaSlice<i8>,
-        key: &[u8; 32],
-        bound: U256,
-        found: &mut CudaSlice<u32>,
-        coord: &mut CudaSlice<u32>,
-        transcript_out: Option<&mut CudaSlice<u32>>,
-        first_tile: usize,
-        tiles: usize,
-        tiles_per_row: usize,
-        tiles_per_region: usize,
-        k: usize,
-        rank: usize,
-    ) -> Result<usize, String> {
+    fn grid_args_ok(&self, first_tile: usize, tiles: usize, tiles_per_row: usize,
+                     tiles_per_region: usize, k: usize, rank: usize) -> Result<(), String> {
         if rank == 0 || !k.is_multiple_of(rank) {
             return Err(format!("rank {rank} does not divide k {k}"));
         }
@@ -877,6 +968,79 @@ impl CudaBackend {
                  does not start and end on row boundaries"
             ));
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "pearl")]
+    fn search_key_dev(&self, key: &[u8; 32]) -> Result<CudaSlice<u32>, String> {
+        let key_words = to_words(key);
+        self.stream
+            .clone_htod(&key_words)
+            .map_err(|e| format!("copying the search key failed: {e}"))
+    }
+
+    /// The 256-bit target as eight big-endian words, most significant group first. The kernel walks
+    /// them from index 0 and matches each against `words[7 - i]`, which is the digest group of the
+    /// same significance: the digest is compared as `from_little_endian`, so its last group is its
+    /// leading one. Getting the index and the byte order independently right is the whole job — a
+    /// kernel that walks the bound from the top and the digest from the same end, or one that reverses
+    /// each group as well, compares the target's most significant group against the digest's least
+    /// significant one and accepts roughly half of every candidate.
+    ///
+    /// Taken from the big-endian bytes rather than by re-slicing `to_little_endian`'s output: that
+    /// output is already little-endian *bytes*, so decoding it as words swaps each four-byte group a
+    /// second time.
+    #[cfg(feature = "pearl")]
+    fn search_bound_dev(&self, bound: U256) -> Result<CudaSlice<u32>, String> {
+        let mut bound_bytes = [0u8; 32];
+        bound.to_big_endian(&mut bound_bytes);
+        let bound_words: [u32; 8] = std::array::from_fn(|i| {
+            u32::from_be_bytes(bound_bytes[i * 4..][..4].try_into().unwrap())
+        });
+        self.stream
+            .clone_htod(&bound_words)
+            .map_err(|e| format!("copying the bound failed: {e}"))
+    }
+
+    /// Searches a batch of 16x16 tiles on the device: fold, hash, bound compare, and claim.
+    ///
+    /// `a_sum` is the noise-applied `A` as `m_tiles * 16` rows of `k` and `b_sum` the same for `Bt`;
+    /// the tile grid is walked linearly and cut into `tiles`/`tiles_per_row`-shaped regions, each with
+    /// its own `found` and `coord` slot. `key` is `dnsA` and `bound` is the 256-bit search bound.
+    ///
+    /// Exactly one tile per region can win, which is what the `atomicCAS` in the kernel enforces: the
+    /// rest of a region's qualifying tiles are discarded, because they would produce the same share.
+    /// A batch of regions in flight therefore cannot have one region's win overwrite another's, and
+    /// the caller can tell which region won without reading back anything but `found`.
+    ///
+    /// Returns the number of regions in the batch that were won.
+    ///
+    /// `found` is cleared before the launch, so a caller can reuse one pair of buffers across a
+    /// whole search without clearing them itself.
+    ///
+    /// `transcript_out` is `Some` only for [`Self::check_fold`], which reads every tile's transcript
+    /// back to compare against the reference fold. Production passes `None`: hashing the transcript
+    /// and comparing the digest already pins the same value, and a 512 KiB read-back per batch to
+    /// learn it a second way is not worth the PCIe round trip.
+    #[cfg(feature = "pearl")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_grid(
+        &self,
+        a_sum: &CudaSlice<i8>,
+        b_sum: &CudaSlice<i8>,
+        key: &[u8; 32],
+        bound: U256,
+        found: &mut CudaSlice<u32>,
+        coord: &mut CudaSlice<u32>,
+        transcript_out: Option<&mut CudaSlice<u32>>,
+        first_tile: usize,
+        tiles: usize,
+        tiles_per_row: usize,
+        tiles_per_region: usize,
+        k: usize,
+        rank: usize,
+    ) -> Result<usize, String> {
+        Self::grid_args_ok(self, first_tile, tiles, tiles_per_row, tiles_per_region, k, rank)?;
 
         let regions = tiles / tiles_per_region;
         if found.len() < regions || coord.len() < regions * 2 {
@@ -890,32 +1054,8 @@ impl CudaBackend {
             ));
         }
 
-        let key_words = to_words(key);
-        let key_dev = self
-            .stream
-            .clone_htod(&key_words)
-            .map_err(|e| format!("copying the search key failed: {e}"))?;
-
-        // The 256-bit target as eight big-endian words, most significant group first. The kernel walks
-        // them from index 0 and matches each against `words[7 - i]`, which is the digest group of
-        // the same significance: the digest is compared as `from_little_endian`, so its last group
-        // is its leading one. Getting the index and the byte order independently right is the whole
-        // job — a kernel that walks the bound from the top and the digest from the same end, or one
-        // that reverses each group as well, compares the target's most significant group against
-        // the digest's least significant one and accepts roughly half of every candidate.
-        //
-        // Taken from the big-endian bytes rather than by re-slicing `to_little_endian`'s output:
-        // that output is already little-endian *bytes*, so decoding it as words swaps each
-        // four-byte group a second time.
-        let mut bound_bytes = [0u8; 32];
-        bound.to_big_endian(&mut bound_bytes);
-        let bound_words: [u32; 8] = std::array::from_fn(|i| {
-            u32::from_be_bytes(bound_bytes[i * 4..][..4].try_into().unwrap())
-        });
-        let bound_dev = self
-            .stream
-            .clone_htod(&bound_words)
-            .map_err(|e| format!("copying the bound failed: {e}"))?;
+        let key_dev = Self::search_key_dev(self, key)?;
+        let bound_dev = Self::search_bound_dev(self, bound)?;
 
         let kernel = self.function("tokenminer_search_grid")?;
         // Before the launch, not after: a geometry that needs more than the default 48 KiB fails at
@@ -1003,6 +1143,328 @@ impl CudaBackend {
             .map_err(|e| format!("reading the found flags back failed: {e}"))?;
 
         Ok(flags.iter().take(regions).filter(|f| **f != 0).count())
+    }
+
+    /// The same search on the wide block: eight warps, each owning a 64x64 tile.
+    ///
+    /// Separate entry point rather than a switch on [`Self::search_grid`], because the block rectangle
+    /// is what changes -- and the grid derivation is the division the kernel performs on `blockIdx.x`,
+    /// so it has to be the wide rectangle here or the kernel maps blocks onto tiles the launch did not
+    /// give it.
+    #[cfg(feature = "pearl")]
+    pub fn search_grid_wide(
+        &self,
+        a_sum: &CudaSlice<i8>,
+        b_sum: &CudaSlice<i8>,
+        key: &[u8; 32],
+        bound: U256,
+        found: &mut CudaSlice<u32>,
+        coord: &mut CudaSlice<u32>,
+        transcript_out: Option<&mut CudaSlice<u32>>,
+        first_tile: usize,
+        tiles: usize,
+        tiles_per_row: usize,
+        tiles_per_region: usize,
+        k: usize,
+        rank: usize,
+    ) -> Result<usize, String> {
+        Self::grid_args_ok(self, first_tile, tiles, tiles_per_row, tiles_per_region, k, rank)?;
+
+        let regions = tiles / tiles_per_region;
+        if found.len() < regions || coord.len() < regions * 2 {
+            return Err(format!(
+                "a batch of {regions} regions needs {} flag words and {} coordinate words, but the \
+                 buffers hold {} and {}",
+                regions,
+                regions * 2,
+                found.len(),
+                coord.len()
+            ));
+        }
+
+        let key_dev = Self::search_key_dev(self, key)?;
+        let bound_dev = Self::search_bound_dev(self, bound)?;
+
+        let kernel = self.function("tokenminer_search_grid_wide")?;
+        Self::pow_opt_in_shared_memory_bytes(&kernel, Self::pow_w_smem_dynamic_bytes(self.arch))?;
+
+        self.stream
+            .memset_zeros(&mut *found)
+            .map_err(|e| format!("clearing the found flags failed: {e}"))?;
+
+        let rows_in_batch = tiles / tiles_per_row;
+        let cols_per_strip = tiles_per_row.div_ceil(Self::POW_W_BLOCK_COLS);
+        let blocks = rows_in_batch.div_ceil(Self::POW_W_BLOCK_ROWS) * cols_per_strip;
+
+        if let Some(buffer) = transcript_out.as_ref() {
+            let want = blocks * Self::POW_W_TILES_PER_BLOCK * Self::POW_TRANSCRIPT_WORDS;
+            if buffer.len() < want {
+                return Err(format!(
+                    "a grid of {blocks} blocks needs {want} transcript words, but the buffer holds {}",
+                    buffer.len()
+                ));
+            }
+        }
+
+        let config = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (Self::POW_W_THREADS, 1, 1),
+            shared_mem_bytes: Self::pow_w_smem_dynamic_bytes(self.arch) as u32,
+        };
+
+        let first_arg = first_tile as u32;
+        let tiles_arg = tiles as u32;
+        let row_arg = tiles_per_row as u32;
+        let region_arg = tiles_per_region as u32;
+        let (k_arg, rank_arg) = (k as i32, rank as i32);
+
+        let mut launch = self.stream.launch_builder(&kernel);
+        launch
+            .arg(a_sum)
+            .arg(b_sum)
+            .arg(&key_dev)
+            .arg(&bound_dev)
+            .arg(&mut *found)
+            .arg(&mut *coord);
+        match transcript_out {
+            Some(buffer) => launch.arg(&*buffer),
+            None => launch.arg(&0u64),
+        };
+        launch
+            .arg(&first_arg)
+            .arg(&tiles_arg)
+            .arg(&row_arg)
+            .arg(&region_arg)
+            .arg(&k_arg)
+            .arg(&rank_arg);
+        unsafe { launch.launch(config) }
+            .map_err(|e| format!("launching tokenminer_search_grid_wide failed: {e}"))?;
+
+        let flags = self
+            .stream
+            .clone_dtoh(&*found)
+            .map_err(|e| format!("reading the found flags back failed: {e}"))?;
+
+        Ok(flags.iter().take(regions).filter(|f| **f != 0).count())
+    }
+
+    /// The wide search with B kept in registers: the fold reads `b_frag`, which is `b_sum` written in
+    /// the order `ldmatrix` would have handed it to each lane, so B never passes through shared memory.
+    ///
+    /// `b_frag` has to come from [`Self::b_frag_order`]. A buffer written row-major is not a slower
+    /// input to this kernel, it is a wrong one: the fold reads each lane's sixteen bytes as four
+    /// fragments from four different rows of the tile, and a row-major buffer gives it four fragments
+    /// from the same row.
+    #[cfg(feature = "pearl")]
+    pub fn search_grid_wide_bdirect(
+        &self,
+        a_sum: &CudaSlice<i8>,
+        b_frag: &CudaSlice<u8>,
+        key: &[u8; 32],
+        bound: U256,
+        found: &mut CudaSlice<u32>,
+        coord: &mut CudaSlice<u32>,
+        transcript_out: Option<&mut CudaSlice<u32>>,
+        first_tile: usize,
+        tiles: usize,
+        tiles_per_row: usize,
+        tiles_per_region: usize,
+        k: usize,
+        rank: usize,
+    ) -> Result<usize, String> {
+        Self::grid_args_ok(self, first_tile, tiles, tiles_per_row, tiles_per_region, k, rank)?;
+
+        // Sized by the grid's width, not its tile count, and by the 32-byte k-block the fold consumes,
+        // not the staged width -- see [`Self::b_frag_order`].
+        let want_frag = tiles_per_row * (k / Self::POW_KB_BYTES) * 32 * 16;
+        if b_frag.len() < want_frag {
+            return Err(format!(
+                "a grid {tiles_per_row} tiles wide needs {want_frag} fragment bytes at k {k}, but the \
+                 buffer holds {}",
+                b_frag.len()
+            ));
+        }
+
+        let regions = tiles / tiles_per_region;
+        if found.len() < regions || coord.len() < regions * 2 {
+            return Err(format!(
+                "a batch of {regions} regions needs {} flag words and {} coordinate words, but the \
+                 buffers hold {} and {}",
+                regions,
+                regions * 2,
+                found.len(),
+                coord.len()
+            ));
+        }
+
+        let key_dev = Self::search_key_dev(self, key)?;
+        let bound_dev = Self::search_bound_dev(self, bound)?;
+
+        let kernel = self.function("tokenminer_search_grid_wide_bdirect")?;
+        // A stages, B does not: the wide block's B buffer is gone from the allocation, and the
+        // transcript is the only other thing in it.
+        let want_smem = Self::POW_STAGES
+            * Self::POW_W_ROW_SLOTS
+            * Self::POW_W_ROW_TILES
+            * 16
+            * Self::pow_smem_stride(self.arch)
+            + Self::POW_W_SMEM_T_BYTES;
+        Self::pow_opt_in_shared_memory_bytes(&kernel, want_smem)?;
+
+        self.stream
+            .memset_zeros(&mut *found)
+            .map_err(|e| format!("clearing the found flags failed: {e}"))?;
+
+        let rows_in_batch = tiles / tiles_per_row;
+        let cols_per_strip = tiles_per_row.div_ceil(Self::POW_W_BLOCK_COLS);
+        let blocks = rows_in_batch.div_ceil(Self::POW_W_BLOCK_ROWS) * cols_per_strip;
+
+        if let Some(buffer) = transcript_out.as_ref() {
+            let want = blocks * Self::POW_W_TILES_PER_BLOCK * Self::POW_TRANSCRIPT_WORDS;
+            if buffer.len() < want {
+                return Err(format!(
+                    "a grid of {blocks} blocks needs {want} transcript words, but the buffer holds {}",
+                    buffer.len()
+                ));
+            }
+        }
+
+        let config = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (Self::POW_W_THREADS, 1, 1),
+            shared_mem_bytes: want_smem as u32,
+        };
+
+        let first_arg = first_tile as u32;
+        let tiles_arg = tiles as u32;
+        let row_arg = tiles_per_row as u32;
+        let region_arg = tiles_per_region as u32;
+        let (k_arg, rank_arg) = (k as i32, rank as i32);
+
+        let mut launch = self.stream.launch_builder(&kernel);
+        launch
+            .arg(a_sum)
+            .arg(b_frag)
+            .arg(&key_dev)
+            .arg(&bound_dev)
+            .arg(&mut *found)
+            .arg(&mut *coord);
+        match transcript_out {
+            Some(buffer) => launch.arg(&*buffer),
+            None => launch.arg(&0u64),
+        };
+        launch
+            .arg(&first_arg)
+            .arg(&tiles_arg)
+            .arg(&row_arg)
+            .arg(&region_arg)
+            .arg(&k_arg)
+            .arg(&rank_arg);
+        unsafe { launch.launch(config) }
+            .map_err(|e| format!("launching tokenminer_search_grid_wide_bdirect failed: {e}"))?;
+
+        let flags = self
+            .stream
+            .clone_dtoh(&*found)
+            .map_err(|e| format!("reading the found flags back failed: {e}"))?;
+
+        Ok(flags.iter().take(regions).filter(|f| **f != 0).count())
+    }
+
+    /// Writes `b_sum` in the order the B-direct fold's `LDG.128` expects: one 16-byte block per
+    /// (tile column, k-block, lane). One block per tile column, one warp per block.
+    ///
+    /// `tile_cols` is the grid's *width*, not its tile count: `b_sum` is `tile_cols` tile columns of
+    /// sixteen rows, so a batch of four tile rows and eight tile columns still gets eight blocks here.
+    /// Sizing it by the tile count writes the same columns over and over and leaves the search reading
+    /// fragments that were never written.
+    #[cfg(feature = "pearl")]
+    pub fn b_frag_order(&self, b_sum: &CudaSlice<i8>, b_frag: &mut CudaSlice<u8>,
+                        tile_cols: usize, k: usize) -> Result<(), String> {
+        let pow_bk = Self::pow_bk(self.arch);
+        if k == 0 || !k.is_multiple_of(pow_bk) {
+            return Err(format!("k {k} is not a whole number of {pow_bk}-byte k-blocks on {arch}",
+                               arch = self.arch));
+        }
+        let want = tile_cols * (k / Self::POW_KB_BYTES) * 32 * 16;
+        if b_frag.len() < want {
+            return Err(format!(
+                "{tile_cols} tile columns at k {k} need {want} fragment bytes, but the buffer holds {}",
+                b_frag.len()
+            ));
+        }
+
+        let kernel = self.function("tokenminer_b_frag_order")?;
+        let k_arg = k as i32;
+        let config = LaunchConfig {
+            grid_dim: (tile_cols as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&kernel);
+        launch.arg(b_sum).arg(&mut *b_frag).arg(&k_arg);
+        unsafe { launch.launch(config) }
+            .map_err(|e| format!("launching tokenminer_b_frag_order failed: {e}"))?;
+        Ok(())
+    }
+
+    /// One search batch, through whichever fold [`PowKernel`] selected.
+    ///
+    /// This is the mining loop's entry point. The three paths are the same fold on the same operands,
+    /// and each is pinned against the same reference by its own check, so reaching this dispatch with a
+    /// selection that disagrees with the reference is a bug, not a faster kernel.
+    ///
+    /// The B-direct path is the only one with a setup step: the fragment buffer has to be written before
+    /// the fold reads it, and it is sized by the grid's width rather than its tile count. A buffer that
+    /// is merely stale -- written for a previous batch of a different width -- reads as a wrong kernel.
+    #[cfg(feature = "pearl")]
+    pub fn search_selected(
+        &mut self,
+        a_sum: &CudaSlice<i8>,
+        b_sum: &CudaSlice<i8>,
+        key: &[u8; 32],
+        bound: U256,
+        found: &mut CudaSlice<u32>,
+        coord: &mut CudaSlice<u32>,
+        transcript_out: Option<&mut CudaSlice<u32>>,
+        first_tile: usize,
+        tiles: usize,
+        tiles_per_row: usize,
+        tiles_per_region: usize,
+        k: usize,
+        rank: usize,
+    ) -> Result<usize, String> {
+        match self.pow_kernel {
+            PowKernel::Shipped => self.search_grid(
+                a_sum, b_sum, key, bound, found, coord, transcript_out,
+                first_tile, tiles, tiles_per_row, tiles_per_region, k, rank,
+            ),
+            PowKernel::Wide => self.search_grid_wide(
+                a_sum, b_sum, key, bound, found, coord, transcript_out,
+                first_tile, tiles, tiles_per_row, tiles_per_region, k, rank,
+            ),
+            PowKernel::Bdirect => {
+                let want = tiles_per_row * (k / Self::POW_KB_BYTES) * 32 * 16;
+                // Absent and too small are the same case: the buffer is the field's whole lifetime, so
+                // the first batch of a run has nothing to grow. A check that builds its own buffer cannot
+                // see this, which is why the route test runs the route through `search_selected` rather
+                // than calling the launch directly.
+                let mut frag = match self.frag.take() {
+                    Some(frag) if frag.len() >= want => frag,
+                    _ => self
+                        .stream
+                        .alloc_zeros::<u8>(want)
+                        .map_err(|e| format!("allocating the fragment buffer failed: {e}"))?,
+                };
+                Self::b_frag_order(self, b_sum, &mut frag, tiles_per_row, k)?;
+                let won = self.search_grid_wide_bdirect(
+                    a_sum, &frag, key, bound, found, coord, transcript_out,
+                    first_tile, tiles, tiles_per_row, tiles_per_region, k, rank,
+                );
+                self.frag = Some(frag);
+                won
+            }
+        }
     }
 
     /// One tile of the search grid, for the checks that pin the fold, hash and bound compare against
@@ -2319,7 +2781,56 @@ impl CudaBackend {
     /// them clears the bound the pool checks, so the share still verifies — it just describes a
     /// different candidate than the coordinates say, and nothing downstream can tell.
     #[cfg(feature = "pearl")]
+    /// One launch entry point, called with the arguments the reference check already knows. A type
+    /// alias cannot live inside an `impl`, so this is spelled out at each signature that needs it.
+    #[cfg(feature = "pearl")]
     fn check_search_grid(&self) -> Result<(), String> {
+        self.check_grid_against_reference(&|a, b, key, bound, found, coord, first_tile, tiles,
+                                          per_row, per_region, k, rank| {
+            self.search_grid(a, b, key, bound, found, coord, None, first_tile, tiles, per_row,
+                             per_region, k, rank)
+        })
+    }
+
+    /// The same reference comparison through the wide block.
+    #[cfg(feature = "pearl")]
+    fn check_search_grid_wide(&self) -> Result<(), String> {
+        // The wide kernels are compiled only for the tensor path, so on Turing there is no entry point
+        // to look up. Skipping here is the same predicate the cubin used, not a second table.
+        if matches!(arch_code(self.arch), Some(code) if code < 800) {
+            return Ok(());
+        }
+        self.check_grid_against_reference(&|a, b, key, bound, found, coord, first_tile, tiles,
+                                          per_row, per_region, k, rank| {
+            self.search_grid_wide(a, b, key, bound, found, coord, None, first_tile, tiles, per_row,
+                                  per_region, k, rank)
+        })
+    }
+
+    /// The same reference comparison through the B-direct fold.
+    ///
+    /// The fragment buffer is built inside the launch, from the operands the check itself picked, so
+    /// the writer kernel is on the path being pinned rather than assumed correct. If the writer's
+    /// layout and the kernel's read disagree, this check fails -- and it is the only place either side
+    /// of that contract is exercised, since nothing else feeds the B-direct kernel.
+    #[cfg(feature = "pearl")]
+    fn check_search_grid_wide_bdirect(&self) -> Result<(), String> {
+        if matches!(arch_code(self.arch), Some(code) if code < 800) {
+            return Ok(());
+        }
+        self.check_grid_against_reference(&|a, b, key, bound, found, coord, first_tile, tiles,
+                                          per_row, per_region, k, rank| {
+            let mut frag = self
+                .stream
+                .alloc_zeros::<u8>(per_row * (k / Self::POW_KB_BYTES) * 32 * 16)
+                .map_err(|e| format!("allocating the fragment buffer failed: {e}"))?;
+            Self::b_frag_order(self, b, &mut frag, per_row, k)?;
+            self.search_grid_wide_bdirect(a, &frag, key, bound, found, coord, None, first_tile,
+                                          tiles, per_row, per_region, k, rank)
+        })
+    }
+
+    fn check_grid_against_reference(&self, launch: GridLaunch) -> Result<(), String> {
         // Three tile rows by two, and a region per tile row, so the regions and the tile rows are
         // different partitions of the same grid. A region size that lined up with the tile row would
         // let a swap between the two go unnoticed.
@@ -2333,7 +2844,17 @@ impl CudaBackend {
         //
         // A 3x2 grid is also short on both axes of the kernel's 16x8 block rectangle, so this runs the
         // short-rectangle paths on every invocation.
-        let (m_tiles, n_tiles, k, rank) = (3usize, 2usize, 128usize, 64usize);
+        //
+        // It has to be *wide enough to reach a second slot on both axes*, though, and 3x2 is not. In the
+        // wide geometry a warp claims only when its own row tile and column tile are inside the block
+        // rectangle, so a 3x2 grid leaves exactly one warp doing any claiming -- the warp at row slot 0,
+        // column slot 0 -- and for that warp `rs` and `cs` are both zero, so swapping the two slot
+        // mappings changes nothing at all. The check reads as a pass while testing one warp.
+        //
+        // Five tile rows reach row slot 1 and nine tile columns reach column slot 1, so at least one
+        // claiming warp has a non-zero `rs` and at least one has a non-zero `cs`, and the two mappings
+        // become distinguishable. Still short on both axes of the 16x16 wide rectangle.
+        let (m_tiles, n_tiles, k, rank) = (5usize, 9usize, 128usize, 64usize);
         let tile = 16usize;
         let tiles_per_region = n_tiles;
         let tiles = m_tiles * n_tiles;
@@ -2408,7 +2929,12 @@ impl CudaBackend {
                 .iter()
                 .min_by_key(|(_, digest)| *digest)
                 .ok_or("the tile grid produced no candidates to search")?;
-            if lowest.0 .0 != 0 {
+            // And off *column* 0 as well, for the same reason in the other direction. The B-direct fold
+            // indexes its fragment buffer by tile column, so a column-0 tile reads the same bytes under a
+            // wrong column stride as under the right one: the check would pass on a winner that cannot
+            // distinguish the two. Requiring the winner off both axes makes the first run sensitive to the
+            // column mapping, not just the row mapping.
+            if lowest.0 .0 != 0 && lowest.0 .1 != 0 {
                 chosen = Some((a, b, priced));
                 break;
             }
@@ -2469,14 +2995,13 @@ impl CudaBackend {
             .ok_or("the tile grid produced no candidates to search")?;
         let ((min_row, min_col), min_digest) = *lowest;
 
-        let won = self.search_grid(
+        let won = launch(
             &a_dev,
             &b_dev,
             &key,
             min_digest,
             &mut found,
             &mut coord,
-            None,
             0,
             tiles,
             n_tiles,
@@ -2521,14 +3046,13 @@ impl CudaBackend {
             .stream
             .alloc_zeros::<u32>(tiles * 2)
             .map_err(|e| format!("allocating coord failed: {e}"))?;
-        let won = self.search_grid(
+        let won = launch(
             &a_dev,
             &b_dev,
             &key,
             U256::MAX,
             &mut solo_found,
             &mut solo_coord,
-            None,
             0,
             tiles,
             n_tiles,
@@ -2536,13 +3060,17 @@ impl CudaBackend {
             k,
             rank,
         )?;
+        let (flags, coords) = read_back(&solo_found, &solo_coord)?;
+        let missing: Vec<String> = (0..tiles)
+            .filter(|t| flags[*t] == 0)
+            .map(|t| format!("({}, {})", t / n_tiles, t % n_tiles))
+            .collect();
         if won != tiles {
             return Err(format!(
                 "with every tile in its own region and an unbounded target, {won} of {tiles} \
-                 claimed"
+                 claimed; missing: {missing:?}"
             ));
         }
-        let (flags, coords) = read_back(&solo_found, &solo_coord)?;
         for ((tile_row, tile_col), _) in &priced {
             let tile = tile_row * n_tiles + tile_col;
             if flags[tile] == 0 {
@@ -2562,14 +3090,13 @@ impl CudaBackend {
         // And a bound nothing reaches leaves every region untouched, so the flags above mean "this
         // candidate cleared" rather than "something ran". Zero is beaten only by a digest of exactly
         // zero, which is not a thing BLAKE3 produces.
-        let won = self.search_grid(
+        let won = launch(
             &a_dev,
             &b_dev,
             &key,
             U256::zero(),
             &mut found,
             &mut coord,
-            None,
             0,
             tiles,
             n_tiles,
@@ -2601,14 +3128,13 @@ impl CudaBackend {
             .min_by_key(|(_, digest)| *digest)
             .ok_or("the tile grid produced no candidates to search")?;
         // One tile row per region, so the batch is exactly the row it was pointed at.
-        let won = self.search_grid(
+        let won = launch(
             &a_dev,
             &b_dev,
             &key,
             target_digest,
             &mut found,
             &mut coord,
-            None,
             target_row * n_tiles,
             n_tiles,
             n_tiles,
@@ -3279,6 +3805,14 @@ impl GpuBackend for CudaBackend {
         self.check_bound()?;
         #[cfg(feature = "pearl")]
         self.check_search_grid()?;
+        // The two harvested geometries are pinned by the same comparison as the shipped one, on the
+        // same operands, so a failure here is the new path being wrong rather than the reference being
+        // soft. They run on every start: an experimental entry point that is only checked when someone
+        // remembers to ask is an experimental entry point that reports shares nobody verified.
+        #[cfg(feature = "pearl")]
+        self.check_search_grid_wide()?;
+        #[cfg(feature = "pearl")]
+        self.check_search_grid_wide_bdirect()?;
 
         Ok(())
     }
@@ -3442,6 +3976,229 @@ mod tests {
         backend
             .check_search_grid()
             .unwrap_or_else(|error| panic!("the search grid indexed the wrong tile: {error}"));
+    }
+
+    /// The wide block, on the same operands and the same reference. Its slot mapping (`warp / 2` and
+    /// `warp % 2`) is the part a test can actually break: swap the two and every tile still folds, but
+    /// the coordinates come back transposed, which a square test shape cannot tell apart.
+    #[cfg(feature = "pearl")]
+    #[test]
+    fn the_wide_search_grid_claims_the_tile_whose_digest_clears_the_bound() {
+        let Ok(backend) = CudaBackend::open(0) else {
+            return;
+        };
+
+        backend
+            .check_search_grid_wide()
+            .unwrap_or_else(|error| panic!("the wide search grid indexed the wrong tile: {error}"));
+    }
+
+    /// The B-direct fold, on the same operands and the same reference -- and through its own writer
+    /// kernel, so the fragment layout is checked as a contract between the two rather than assumed.
+    #[cfg(feature = "pearl")]
+    #[test]
+    fn the_bdirect_search_grid_claims_the_tile_whose_digest_clears_the_bound() {
+        let Ok(backend) = CudaBackend::open(0) else {
+            return;
+        };
+
+        backend
+            .check_search_grid_wide_bdirect()
+            .unwrap_or_else(|error| panic!("the B-direct fold read the wrong fragment: {error}"));
+    }
+
+    /// Each route the mining loop can be sent down, checked against the reference on the path the loop
+    /// actually uses.
+    ///
+    /// What this pins is the *route*, not the fold: the fragment buffer is grown here rather than built
+    /// by the caller, so a buffer sized for a previous batch's width shows up. It cannot pin which
+    /// kernel ran, because all three agree by construction -- a route that quietly fell back to the
+    /// shipped kernel would pass. That is the honest limit of this test, and it is worth stating rather
+    /// than letting the test read as stronger than it is.
+    #[cfg(feature = "pearl")]
+    #[test]
+    fn each_route_answers_the_reference_on_the_mining_path() {
+        let Ok(mut backend) = CudaBackend::open(0) else {
+            return;
+        };
+        if matches!(arch_code(backend.arch), Some(code) if code < 800) {
+            return;
+        }
+
+        // Wide enough to reach a second slot on both axes, for the same reason the reference check is.
+        let m_tiles = 5usize;
+        let k = 128usize;
+        let rank = 64usize;
+        let tile = 16usize;
+        let key = [0x5a; 32];
+
+        let signal = |i: usize, salt: u64| -> i8 {
+            let mixed = (i as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(salt);
+            (((mixed >> 33) & 0x7F) as i8) - 64
+        };
+
+        // Two shapes, small then large. The fragment buffer is a field kept across batches, so the
+        // second run has to *grow* it rather than allocate it fresh -- and a buffer left at the first
+        // shape's size is exactly the failure the per-kernel checks cannot see, because they build the
+        // buffer themselves.
+        for kernel in [PowKernel::Shipped, PowKernel::Wide, PowKernel::Bdirect] {
+            backend.pow_kernel = kernel;
+
+            for n_tiles in [9usize, 16usize] {
+                let a: Vec<i8> = (0..m_tiles * tile * k).map(|i| signal(i, 11)).collect();
+                let b: Vec<i8> = (0..n_tiles * tile * k).map(|i| signal(i, 29)).collect();
+
+                let mut lowest: Option<(((usize, usize), U256))> = None;
+                for r in 0..m_tiles {
+                    for c in 0..n_tiles {
+                        let words = backend
+                            .jackpot_fold(
+                                &a[r * tile * k..][..tile * k],
+                                &b[c * tile * k..][..tile * k],
+                                k,
+                                rank,
+                                tile,
+                                tile,
+                            )
+                            .unwrap_or_else(|error| panic!("reference fold failed: {error}"));
+                        let digest = U256::from_little_endian(
+                            &backend
+                                .jackpot_hash(&transcript_bytes(&words), &key)
+                                .unwrap_or_else(|error| panic!("reference hash failed: {error}")),
+                        );
+                        if lowest.is_none() || digest < lowest.unwrap().1 {
+                            lowest = Some(((r, c), digest));
+                        }
+                    }
+                }
+                let lowest = lowest.unwrap();
+
+                let a_dev = backend
+                    .stream
+                    .clone_htod(&a)
+                    .unwrap_or_else(|error| panic!("copying A failed: {error}"));
+                let b_dev = backend
+                    .stream
+                    .clone_htod(&b)
+                    .unwrap_or_else(|error| panic!("copying B failed: {error}"));
+                let tiles = m_tiles * n_tiles;
+                let mut found = backend
+                    .stream
+                    .alloc_zeros::<u32>(tiles)
+                    .unwrap_or_else(|error| panic!("allocating found failed: {error}"));
+                let mut coord = backend
+                    .stream
+                    .alloc_zeros::<u32>(tiles * 2)
+                    .unwrap_or_else(|error| panic!("allocating coord failed: {error}"));
+
+                // A bound at the lowest digest is cleared by that tile alone, so exactly one region
+                // claims and it has to be that tile's.
+                let won = backend
+                    .search_selected(&a_dev, &b_dev, &key, lowest.1, &mut found, &mut coord, None, 0,
+                                     tiles, n_tiles, 1, k, rank)
+                    .unwrap_or_else(|error| panic!("{kernel:?} route failed: {error}"));
+                if won != 1 {
+                    panic!("{kernel:?} route at {m_tiles}x{n_tiles} claimed {won} of {tiles}, not 1");
+                }
+
+                let flags = backend
+                    .stream
+                    .clone_dtoh(&found)
+                    .unwrap_or_else(|error| panic!("reading flags failed: {error}"));
+                let coords = backend
+                    .stream
+                    .clone_dtoh(&coord)
+                    .unwrap_or_else(|error| panic!("reading coords failed: {error}"));
+
+                // Only the B-direct arm touches `frag`, so its being allocated here is the one thing
+                // the test can observe that says the arm actually ran. The wide arm has no such tell:
+                // point it at `search_grid` and every answer still agrees, so this test pins each
+                // route's geometry, not the dispatch that selects it.
+                if matches!(kernel, PowKernel::Bdirect) {
+                    assert!(backend.frag.is_some(), "{kernel:?} route did not run its own arm");
+                }
+
+                let region = (lowest.0).0 * n_tiles + (lowest.0).1;
+                assert_eq!(flags[region], 1, "{kernel:?} route did not claim the lowest tile");
+                assert_eq!(
+                    (coords[region * 2] as usize, coords[region * 2 + 1] as usize),
+                    lowest.0,
+                    "{kernel:?} route at {m_tiles}x{n_tiles} reported a different tile than the                      reference priced lowest"
+                );
+            }
+        }
+    }
+
+    /// The fragment writer checked against the mapping `ldmatrix` actually performs, not against itself.
+    ///
+    /// The B-direct check above pins the *pair* — writer and reader agree — but it cannot say which side
+    /// is wrong when they disagree, and both sides being wrong the same way passes it. This pins the
+    /// writer to the instruction's own semantics: matrix `i` at row `lane >> 2`, columns `(lane & 3) * 2`
+    /// and `+1`, which is four bytes at `(lane & 3) * 4`.
+    ///
+    /// Every input byte is distinct, which is what makes the check bite. A row-major writer produces a
+    /// buffer of the right shape and the wrong contents, so a check that only compared shapes would pass
+    /// it.
+    #[cfg(feature = "pearl")]
+    #[test]
+    fn the_fragment_writer_hands_each_lane_the_bytes_ldmatrix_would() {
+        let Ok(backend) = CudaBackend::open(0) else {
+            return;
+        };
+        if matches!(arch_code(backend.arch), Some(code) if code < 800) {
+            return;
+        }
+
+        // Three tile columns at k = 64: two k-blocks per column, so the check crosses a k-block boundary
+        // instead of sitting inside one.
+        let tile_cols = 3usize;
+        let k = 64usize;
+        let kb_total = k / CudaBackend::POW_KB_BYTES;
+
+        let b: Vec<i8> = (0..tile_cols * 16 * k)
+            .map(|i| ((i as u64) % 251) as i8)
+            .collect();
+
+        let b_dev = backend
+            .stream
+            .clone_htod(&b)
+            .unwrap_or_else(|error| panic!("copying B failed: {error}"));
+        let mut frag = backend
+            .stream
+            .alloc_zeros::<u8>(tile_cols * kb_total * 32 * 16)
+            .unwrap_or_else(|error| panic!("allocating the fragment buffer failed: {error}"));
+        backend
+            .b_frag_order(&b_dev, &mut frag, tile_cols, k)
+            .unwrap_or_else(|error| panic!("the fragment writer failed: {error}"));
+
+        let got = backend
+            .stream
+            .clone_dtoh(&frag)
+            .unwrap_or_else(|error| panic!("reading the fragment buffer back failed: {error}"));
+
+        for tile in 0..tile_cols {
+            for kb in 0..kb_total {
+                for lane in 0..32 {
+                    for i in 0..4 {
+                        // Matrix `i` is rows `(i & 1) * 8 .. + 7` and bytes `(i >> 1) * 16 .. + 15`. That
+                        // is the address `pow_ldmatrix_x4` builds from `lane`: row base from the low bit of
+                        // the matrix index, byte base from its high bit.
+                        let row = (i & 1) * 8 + (lane >> 2);
+                        let byte = kb * 32 + (i >> 1) * 16 + (lane & 3) * 4;
+                        let want = b[(tile * 16 + row) * k + byte];
+                        let at = ((tile * kb_total + kb) * 32 + lane) * 16 + i * 4;
+                        assert_eq!(
+                            got[at] as i8, want,
+                            "tile {tile} k-block {kb} lane {lane} element {i}: the writer put \
+                             {got_at} where ldmatrix would have read byte {byte} of tile row {row}",
+                            got_at = got[at]
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The Philox fill must be the reference stream, and a window of it must match a whole-matrix
