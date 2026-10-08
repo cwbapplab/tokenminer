@@ -17,9 +17,11 @@ repeat them.
    memory. The same blob kernel reads **180.7 TMAC/s on a constant fill and 133.4 on a spread
    pattern** — a 40% overstatement, from data alone. Both `bench_fold.cu` and `bench_energy.cu`
    now use a full-period mix and warn on the impulse/all-ones modes.
-2. **Compare within one process, never across runs.** The blob's own rate moves ~17% between runs
-   of the same binary (265 ms cold vs 193 ms warm on one session). Only a ratio measured back to
-   back means anything.
+2. **Compare within one process, never across runs.** The blob's own rate moves *a lot* between
+   runs of the same binary — it read 133.8, 165.3, 176.1 and 183.2 TMAC/s across sessions, so a
+   "ratio to the blob" taken from different runs can swing 0.78 to 0.93 on identical code. Only a
+   ratio measured back to back in one process means anything. This is why §5e-bis quotes
+   "B-pipe vs staged within one run" as the load-bearing number.
 3. **A green check that cannot fail is not a check.** The fold harness copied the blob's output into
    the transcript buffer before running ours for a full day, which made "transcripts identical: yes"
    vacuously true and hid four real kernel bugs. It now poisons the buffer before *both* runs and
@@ -204,9 +206,53 @@ theory says:
 
 **-27% power, +17% clock.** But the rate fell anyway: the staged fold's `cp.async` pipeline hides
 B's global latency, and reading B synchronously from global puts it back on the critical path, so
-B-direct is ~2x worse *per clock*. **A naive B-direct is a loss (56 vs 95).** It only pays if B's
-fragments are double-buffered in registers across k-blocks (which is what the reference's 253
-registers buy), so the mma never waits on the load. That variant is untried.
+B-direct is ~2x worse *per clock*. **A naive B-direct is a loss (56 vs 95).**
+
+#### 5e-bis. Register-pipelined B-direct (`FOLD_BPIPE`) — the win
+
+That naive loss is *entirely* latency exposure, and register double-buffering fixes it. `FOLD_BPIPE`
+keeps the next k-block's B fragments in a second register buffer: each iteration issues k-block
+`kb+1`'s `LDG.128`s, then runs k-block `kb`'s `ldmatrix` + 32 mma, then rotates. The load is in
+flight across a whole k-block, so the mma never waits on it. Measured in one session, all
+fold-checked before their timings were believed (transcripts identical, both sides seen to write
+every slot, sabotage bites):
+
+| fold | TMAC/s | blob (co-timed) | ratio | regs | blocks/SM | W | pJ/MAC |
+|---|---|---|---|---|---|---|---|
+| staged B (ships) | 97.2 | 176.1 | 0.55 | 168 | 3 | 342 | 3.52 |
+| B-direct, synchronous | 58.7 | 183.2 | 0.32 | 168 | 3 | 223 | 3.80 |
+| **register-pipelined B-direct** | **137.0** | **176.7** | **0.78** | 214 | 2 | 345 | **2.51** |
+| Triton blob | 176.1 | — | — | 211 | 2 | 339 | 1.95 |
+| register-resident peak | 234.1 | — | — | — | — | 261 | 1.11 |
+
+**Two conclusions, and both are the point of the whole exercise:**
+
+- **+41% over the shipping hand-written fold, and −28% energy per MAC** — both axes at once, which
+  is the outcome that only a real architecture change produces. Under the cap a watt saved is clock
+  recovered, so at *equal* sustained power (both settle at 252 W) B-pipe does **127.3 vs 92.2
+  TMAC/s, +38%** — a pure energy win, not a time-for-power trade.
+- **The sync-vs-pipelined gap is 58.7 → 137.0, 2.33x.** B-direct fails only because its load sits on
+  the critical path; give it a k-block of slack and the "loses 2x per clock" result (5e) inverts.
+  Same instruction mix, same shared-memory footprint (18432 B), same warps.
+
+Two implementation facts that cost real time and are worth not rediscovering:
+
+- **`#pragma unroll 2` is load-bearing.** It is what turns the `bnext → bcur` rotate into register
+  renaming; without it ptxas keeps the copy and the pipeline does not overlap.
+- **`FOLD_N_ATOMS` (16) is the accumulator count, not the B-fragment count (8).** A k-block has eight
+  16-column B tiles, each feeding *two* n8 atoms. Substituting `FOLD_N_ATOMS` for the B-fragment
+  bound reads past the accumulator array — and it does so *plausibly*: impulse operands passed
+  (every B value but k=0 is zero, so an index error is invisible), and it read **151 TMAC/s** on a
+  kernel that was computing out-of-bounds garbage. Only a spread-pattern value check caught it.
+  The bound is `FOLD_B_TILES`.
+
+**Where it stands against what ships.** Production launches the **Triton blob**, not `fold_sm120`,
+so the question is B-pipe vs the blob — and that ratio is **run-dependent, because the blob's own
+reading is**: across sessions the blob measured 133.8, 165.3, 176.1 and 183.2 TMAC/s on the same
+binary and inputs, while B-pipe stayed in 125–141. The ratio ranged **0.78 to 0.93**; in the best
+run B-pipe is at *parity* with the shipping kernel. The stable, load-bearing number is
+**B-pipe vs staged within one run: +35% to +41% every time.** Closing the last few percent to the
+blob is the remaining work; §7 names the levers.
 
 ### 5f. Everything else — no change, or not applicable
 
@@ -275,19 +321,38 @@ redundant 256 MiB passes per matrix. That is per-win latency, not hashrate.
 
 Ranked by expected value against the measurements above:
 
-1. **Register-double-buffered B-direct** (5e). Keeps the -27% energy / +17% clock and restores the
-   latency hiding the staged fold gets from `cp.async`. Untried, and the reference's 253-register
-   design is the model. **The realistic prize is the ~15-17% of clock the staged fold loses to the
-   cap, not the 1.65x to tensor peak.**
+1. **Close B-pipe's last 0.78 → 1.0 against the blob** (5e-bis). The one axis not yet exercised is
+   the warp tile: the blob uses m=4 and pays a cross-warp reduction for it (4.0 MACs per shared
+   byte); our m=2 gets 3.20 (5a). At **m=2 the accumulator is 128 registers, but with B out of
+   shared the register budget is different** — m=3 (192 accumulator registers) was ruled out before
+   only because B's staging plus the operand working set pushed past 255. It is worth re-deriving
+   that ceiling for the B-pipe shape rather than inheriting the old one. Any gain here is
+   accumulator-register-bound, not shared-memory-bound.
 2. **2-CTA cluster B multicast** (5g). Mechanism verified present on sm_120a; expected value lower
    than it looks because it targets DRAM, which is our smaller term. Measure before believing.
-3. **Nothing in the tile shape.** m=4 needs 256 accumulator registers, m=3 does not tile. Section 5a
-   is a proof, not a preference.
+3. **Nothing in the tile shape at m≤2.** m=4 needs 256 accumulator registers, m=3 does not tile a
+   128-row block. Section 5a is a proof, not a preference.
 
-The bar for any of these is the **blob's 1.43 nJ/MAC**, not our hand-written kernel's ~2.2 — a
-rewrite has to beat the shipping kernel's energy, or it is a regression even if it beats our own
-alternatives.
+The bar for any of these is the **blob's 1.95 pJ/MAC** (this session's co-timed reading), not our
+hand-written kernel's 2.51 — B-pipe has to beat the shipping kernel's energy, or it is a regression
+even though it beat our own staged alternative by 28%.
 
 **What not to try again:** occupancy/registers (5b), the six dead staging levers (5c), TMA (5c), the
 tile rectangle (5f), split-k, and any bandwidth framing (5f). Each was measured; each is recorded
 above with its number.
+
+---
+
+## 8. A note on the power reading
+
+The box's power limit is **not fixed at 252 W**. This session `nvidia-smi -q -d POWER` reports
+Current = Requested = Default = **360 W**, yet a sustained fold still settled at **252 W mean** for
+both the staged fold and B-pipe, with `power.draw` excursions to 368 observed transiently. Two
+things follow:
+
+- Report energy **per MAC** (or a co-timed ratio), never "TMAC/s at the cap" against a hard-coded
+  wattage — the cap is a moving target and the harness's `PEAK_WATT` default of 252 is a *label*,
+  not a measurement.
+- The B-pipe vs staged comparison above is drawn from two runs that both settled at 252 W, so the
+  +38% is robust to whatever the limit actually is. The earlier 345 W / 342 W means were taken with
+  a sampler that included cold (pre-warmup) low-power samples and are not the steady state.

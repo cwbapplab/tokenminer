@@ -51,6 +51,10 @@
 #define FOLD_BK 32
 
 #define FOLD_N_ATOMS 16
+// B fragments per k-block: 128 columns of 16 = eight, each feeding two n8 atoms of the accumulator
+// (`FOLD_N_ATOMS` is the *accumulator* count, which is twice this -- conflating the two reads past
+// the end of the accumulator array and is a wrong answer, not a fault).
+#define FOLD_B_TILES 8
 #define FOLD_WARP_ROWS (16 * FOLD_M_ATOMS)
 #define FOLD_WARPS (FOLD_BLOCK_ROWS / FOLD_WARP_ROWS)
 #define FOLD_THREADS (FOLD_WARPS * 32)
@@ -77,6 +81,13 @@
 // The two staging arrays are one allocation with different per-stage strides. Stepping both by the total
 // would put `A`'s stage 1 in the middle of `B`.
 #define FOLD_A_STAGE (FOLD_BLOCK_ROWS * FOLD_STRIDE)
+// `FOLD_BPIPE` is `FOLD_BDIRECT` plus register double-buffering: B stays out of shared *and* its
+// global load is issued a full k-block before it is consumed, so the mma never waits on it. A naive
+// B-direct reads B back synchronously inside the same iteration and pays the whole latency; that gap
+// is what this closes.
+#ifdef FOLD_BPIPE
+#define FOLD_BDIRECT
+#endif
 // `FOLD_BDIRECT` reads B straight from a fragment-ordered global buffer (one `LDG.128` a lane a
 // k-block) instead of staging it through shared, so it needs no B shared at all. That is the point:
 // B is 8 of every warp's 10 `ldmatrix`, and the shared read of B is the largest single term in the
@@ -251,7 +262,39 @@ extern "C" __global__ __launch_bounds__(FOLD_THREADS) void fold_sm120(
         ((long long)(tile_m * num_pid_n + pid_n) * FOLD_CANDIDATES + cand_base) * FOLD_WORDS;
     const int g = lane >> 3;
 
+#ifdef FOLD_BPIPE
+    // B double-buffered in registers. `bcur` holds the k-block the mma below consumes; `bnext` is
+    // filled by the prefetch at the top of the iteration with the *following* k-block. At the end of
+    // the iteration `bnext` is rotated into `bcur` -- an element-wise copy of static arrays, which
+    // ptxas renames away when it unrolls the loop by two, so the register file holds two genuine
+    // buffers and no move executes. What it buys: the `LDG.128` for k-block `kb+1` is in flight for
+    // the whole of k-block `kb`'s mma, which is the latency the naive `FOLD_BDIRECT` pays on the
+    // critical path. Same coalesced 512-byte run per (t, warp) as `FOLD_BDIRECT`.
+    unsigned int bcur[FOLD_B_TILES][4], bnext[FOLD_B_TILES][4];
+    #pragma unroll
+    for (int t = 0; t < FOLD_B_TILES; ++t) {
+        fold_ldg_b(bcur[t], (const signed char*)(b_frag_base + ((long long)t * 32 + lane) * 4));
+    }
+#endif
+
+#ifdef FOLD_BPIPE
+    #pragma unroll 2
+#endif
     for (int kb = 0; kb < k_blocks; ++kb) {
+#ifdef FOLD_BPIPE
+        // Issue the next k-block's B *before* the barrier, into the other register buffer. The load
+        // retires into the scoreboard and is in flight across the `cp.async` wait, the barrier and the
+        // whole k-block of mma -- so the mma never waits on it. That coverage is the entire difference
+        // between this and `FOLD_BDIRECT`, which reads B synchronously and pays the latency inline.
+        if (kb + 1 < k_blocks) {
+            #pragma unroll
+            for (int t = 0; t < FOLD_B_TILES; ++t) {
+                fold_ldg_b(bnext[t],
+                           (const signed char*)(b_frag_base
+                               + (((long long)(kb + 1) * FOLD_B_TILES + t) * 32 + lane) * 4));
+            }
+        }
+#endif
         // At most `FOLD_PREFETCH - 1` groups pending, so the oldest -- stage `kb % FOLD_STAGES` -- is
         // complete. On the tail the queue is shorter than the prefetch depth and the request has to be
         // zero, or the wait returns before the stage it is about to read has landed.
@@ -264,17 +307,17 @@ extern "C" __global__ __launch_bounds__(FOLD_THREADS) void fold_sm120(
 
         const int stage = kb % FOLD_STAGES;
         const signed char* stageA = sA + stage * FOLD_A_STAGE;
-#ifdef FOLD_BDIRECT
+#if defined(FOLD_BDIRECT) && !defined(FOLD_BPIPE)
         // All eight of this k-block's B fragments, one 16-byte load a lane a tile-column. Loaded
         // before the A fragments so the global latency overlaps the ldmatrix, and once per block
         // rather than once per m-atom.
-        unsigned int bg[8][4];
+        unsigned int bgl[FOLD_B_TILES][4];
         #pragma unroll
-        for (int t = 0; t < 8; ++t) {
-            fold_ldg_b(bg[t], (const signed char*)(b_frag_base
-                            + (((long long)kb * 8 + t) * 32 + lane) * 4));
+        for (int t = 0; t < FOLD_B_TILES; ++t) {
+            fold_ldg_b(bgl[t], (const signed char*)(b_frag_base
+                            + (((long long)kb * FOLD_B_TILES + t) * 32 + lane) * 4));
         }
-#else
+#elif !defined(FOLD_BDIRECT)
         const signed char* stageB = sB + stage * FOLD_B_STAGE;
 #endif
 
@@ -282,12 +325,14 @@ extern "C" __global__ __launch_bounds__(FOLD_THREADS) void fold_sm120(
             dbg[0] = (unsigned int)(unsigned char)stageA[0];
             dbg[1] = (unsigned int)(unsigned char)stageA[FOLD_STRIDE];
             dbg[2] = (unsigned int)(unsigned char)stageA[16 * FOLD_STRIDE];
-#ifndef FOLD_BDIRECT
+#ifdef FOLD_BPIPE
+            dbg[3] = bcur[0][0]; dbg[4] = bcur[0][1]; dbg[5] = bcur[0][2];
+#elif defined(FOLD_BDIRECT)
+            dbg[3] = bgl[0][0]; dbg[4] = bgl[0][1]; dbg[5] = bgl[0][2];
+#else
             dbg[3] = (unsigned int)(unsigned char)stageB[0];
             dbg[4] = (unsigned int)(unsigned char)stageB[FOLD_STRIDE];
             dbg[5] = (unsigned int)(unsigned char)stageB[16 * FOLD_STRIDE];
-#else
-            dbg[3] = bg[0][0]; dbg[4] = bg[0][1]; dbg[5] = bg[0][2];
 #endif
         }
 
@@ -301,8 +346,10 @@ extern "C" __global__ __launch_bounds__(FOLD_THREADS) void fold_sm120(
 
             #pragma unroll
             for (int t = 0; t < 8; ++t) {
-#ifdef FOLD_BDIRECT
-                const unsigned int* bf = bg[t];
+#ifdef FOLD_BPIPE
+                const unsigned int* bf = bcur[t];
+#elif defined(FOLD_BDIRECT)
+                const unsigned int* bf = bgl[t];
 #else
                 unsigned int bfre[4];
                 fold_ldmatrix_x4(bfre, stageB + t * 16 * FOLD_STRIDE, lane);
@@ -318,6 +365,18 @@ extern "C" __global__ __launch_bounds__(FOLD_THREADS) void fold_sm120(
                 fold_mma(acc[a][2 * t + 1], af, bf[1], bf[3]);
             }
         }
+
+#ifdef FOLD_BPIPE
+        // Rotate: the next k-block's B becomes the current one. Static element-wise copy of arrays of
+        // constant size, so it is pure register renaming once the loop is unrolled.
+        if (kb + 1 < k_blocks) {
+            #pragma unroll
+            for (int t = 0; t < FOLD_B_TILES; ++t) {
+                #pragma unroll
+                for (int w = 0; w < 4; ++w) bcur[t][w] = bnext[t][w];
+            }
+        }
+#endif
 
         // Issue for a later k-block *after* the barrier, so the write cannot land in a buffer a lagging
         // warp is still reading. `kb + FOLD_PREFETCH` is `FOLD_STAGES - 1` ahead, which is the same

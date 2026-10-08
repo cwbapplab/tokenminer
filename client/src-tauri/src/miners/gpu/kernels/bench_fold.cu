@@ -304,6 +304,7 @@ int main(int argc, char** argv) {
                     d[0], d[1], d[2], d[3], d[4], d[5]);
         std::printf("     af=%08x %08x %08x %08x   bf=%08x %08x %08x %08x\n",
                     d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13]);
+        std::printf("     kb1 t0 bf=%08x %08x %08x %08x\n", d[16], d[17], d[18], d[19]);
     }
 
     int ours_poison_left = 0, ours_nonzero = 0;

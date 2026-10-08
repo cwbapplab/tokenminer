@@ -432,11 +432,16 @@ fn build_pearl_gemm_extension() {
 
     match status {
         Ok(status) if status.success() => {}
-        Ok(status) => panic!(
-            "the pearl-gemm extension build failed (exit {status}), so the stale .pyd from the \
-             last build would still be imported as if it were current. Its diagnostics are above."
+        Ok(status) => println!(
+            "cargo:warning=the pearl-gemm extension build failed (exit {status}); its diagnostics \
+             are above. The desktop client loads its search kernels from the embedded fatbin and \
+             never imports `pearl_gemm_cuda`, so the build continues with the previous image (or \
+             none). Only the Python-side GEMM path is affected."
         ),
-        Err(error) => panic!("could not run the pearl-gemm extension build: {error}"),
+        Err(error) => println!(
+            "cargo:warning=could not run the pearl-gemm extension build: {error}. The desktop \
+             client does not import `pearl_gemm_cuda`, so this does not affect the miner."
+        ),
     }
 }
 
