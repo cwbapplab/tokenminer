@@ -37,27 +37,40 @@ pub struct PearlMining {
 }
 
 impl Default for PearlMining {
-    /// The dimensions Open-Pearl-Miner mines at (`python/pool_common.py`), and the ones the GPU
-    /// search is built around.
+    /// The configuration the split search path runs at.
     ///
-    /// These are not arbitrary. A share's difficulty is a function of `tile * k`, so a smaller `k`
-    /// is not a cheaper configuration, it is a *slower* one — the same proof carries proportionally
-    /// less weight in the target, and the pool's difficulty is set for this configuration. The
-    /// patterns are `range(16)` for the same reason the GPU search hashes 16x16 tiles: a hash tile
-    /// is what consensus prices, and a different shape is a different amount of work per share.
+    /// `k` and `rank` are not a preference here; they are the only pair the search blob can satisfy.
+    /// Its accumulator is never reset between k-iterations, so each checkpoint is the XOR of the
+    /// *running* sums over a group of `BK * REDUCE_EVERY = 128` columns, and the verifier's fold groups
+    /// `r` columns per iteration — so `r` has to be 128. The blob writes 16 words per candidate, so
+    /// `k / r <= 16`, and `zk_pow`'s `k >= 16r` closes the interval at `k = 16r = 2048`. The derivation
+    /// lives with the constants in [`super::gpu::bufs`], which refuses anything else, and gate D
+    /// measures it on the device rather than asserting it.
     ///
-    /// The old defaults (`1024 x 1024`, `k = 2048`, rank 128, a 2x64 pattern) were the reference
-    /// *miner's* configuration, not its production one, and the 2x64 pattern has no representation
-    /// in the grid kernel at all — it sampled eight rows at a time.
+    /// The consequence for the pool is stated rather than hidden. A share's difficulty is a function of
+    /// `tile_size * dot_product_length`, and the candidate tile is still 256 cells — `2 x 128` instead of
+    /// `16 x 16` — while the depth is 2048 instead of 4096, so the adjustment factor halves. The same
+    /// hashrate therefore meets the same target at half the work per share, and the share rate at a
+    /// given hashrate changes. `rank = 128` is exactly `PENALTY_BASE_RANK`, so no penalty applies.
+    ///
+    /// `m` and `n` are the one part not forced: any whole number of 128 tiles is accepted. They stay at
+    /// the dimensions every measurement in this project was recorded at, but the split path costs memory
+    /// the fused path did not — a transcript per candidate, 64 bytes each, so at these dimensions the
+    /// transcript buffer alone is 4.3 GB and the whole footprint is about 7.4 GB. The check in
+    /// `pearl_gpu::open` refuses up front on a card that cannot hold it, which is the honest outcome:
+    /// the fused path hashed inside the launch and never held a transcript per candidate at all.
     fn default() -> Self {
         Self {
             m: 131_072,
             n: 131_072,
-            // k = 16 * rank exactly, the tightest the verifier's `k >= 16r` allows.
-            k: 4096,
-            rank: 256,
-            rows_pattern: (0..16).collect(),
-            cols_pattern: (0..16).collect(),
+            // k = 16 * rank exactly, the tightest the verifier's `k >= 16r` allows and the only value
+            // the blob's 16-word candidate slot can hold.
+            k: 2048,
+            rank: 128,
+            // One candidate is a 2 x 128 window inside the blob's 128 x 128 tile, so the rows pattern is
+            // the two rows the candidate names and the cols pattern is the whole strip.
+            rows_pattern: vec![0, 1],
+            cols_pattern: (0..128).collect(),
             gzip: false,
         }
     }
@@ -66,29 +79,29 @@ impl Default for PearlMining {
 impl PearlMining {
     /// Tiles per second to TH/s — the unit Open-Pearl-Miner and every other Pearl miner reports.
     ///
-    /// One candidate tile is one 16x16 output of the full k-deep GEMM, so it is `16 * 16 * k` MACs,
-    /// and consensus counts work in MACs: a TH is 10^12 of them. The reference converts exactly this
-    /// way, and writes the same constant twice — `TH_PER_MTILE = (1 << 20) / 1e6`, annotated
-    /// "1 Mtile/s ~= 1.0486 TH/s" (`tests/bench_split.py:20`), and
-    /// `TH_PER_REGION = tiles * (1 << 20) / 1e12` (`tests/bench_capi.py:18`). Its `1 << 20` is
-    /// just `16 * 16 * 4096` written out, which is why this takes the depth from `k` instead of
-    /// hardcoding it: at a k this miner also allows, a tile is twice the work and has to be counted
-    /// as such. At the shipped default the two agree exactly, so the numbers are comparable.
+    /// One candidate tile is one `rows_pattern x cols_pattern` output of the full k-deep GEMM, so it is
+    /// `h * w * k` MACs, and consensus counts work in MACs: a TH is 10^12 of them. The reference
+    /// converts exactly this way and writes the same constant twice — `TH_PER_MTILE = (1 << 20) / 1e6`,
+    /// annotated "1 Mtile/s ~= 1.0486 TH/s" (`tests/bench_split.py:20`), and
+    /// `TH_PER_REGION = tiles * (1 << 20) / 1e12` (`tests/bench_capi.py:18`). Its `1 << 20` is just
+    /// `16 * 16 * 4096` written out, which is why this takes the depth from `k` instead of hardcoding
+    /// it: at a k this miner also allows, a tile is twice the work and has to be counted as such.
     ///
-    /// The 16x16 is not configurable here because it is not this module's choice: the grid kernel
-    /// folds 16x16 tiles, the patterns below are `range(16)` because a hash tile must span one, and
-    /// the verifier prices a tile as `hash_tile_h * hash_tile_w * dot_product_length` — so this
-    /// counts the work the card actually did and it is the work consensus pays for. The tile is
-    /// hardcoded rather than read off `rows_pattern.len()` precisely because a configuration with
-    /// some other tile is one the kernel does not implement; reading the length would report a
-    /// consensus-priced rate for machine throughput that never happened, and report it silently.
+    /// At the split path's shape a tile is `2 * 128 * 2048` = 524,288 MACs, so the same tile rate is
+    /// half the reference's constant. That is not a discrepancy to paper over — it is the same fact the
+    /// difficulty adjustment states, that this configuration prices half the work per candidate. The tile
+    /// is read off the patterns rather than hardcoded because the split path's tile *is* the pattern: the
+    /// blob folds a 128-column strip and reports 64 candidates inside it, each a 2x128 window, so `h * w`
+    /// is the window the kernel actually computed. A hardcoded 16x16 would report the reference's rate
+    /// for a shape this kernel no longer runs.
     ///
-    /// This is not a cosmetic rename. A card folding 56 TH/s is folding about 5.3e7 tiles/s, so
-    /// publishing the tile rate as the hashrate put our figures three orders of magnitude from every
-    /// other Pearl miner's — including the reference's, the only other Pearl miner whose
+    /// This is not a cosmetic rename. A card folding 56 TH/s is folding about 1.07e8 tiles/s at this
+    /// shape, so publishing the tile rate as the hashrate put our figures three orders of magnitude from
+    /// every other Pearl miner's — including the reference's, the only other Pearl miner whose
     /// architecture we can actually check.
     pub fn th_per_second(&self, tiles_per_second: f64) -> f64 {
-        tiles_per_second * (16.0 * 16.0 * self.k as f64) / 1e12
+        let tile = self.rows_pattern.len() as f64 * self.cols_pattern.len() as f64 * self.k as f64;
+        tiles_per_second * tile / 1e12
     }
 }
 
@@ -203,15 +216,36 @@ mod tests {
     /// the rounding can express.
     #[test]
     fn one_mtile_per_second_is_the_references_own_tera_hash_constant() {
-        let th_per_second = PearlMining::default().th_per_second(1e6);
+        // The reference's own shape, not the shipped default: `1 << 20` is `16 * 16 * 4096` written out,
+        // so the constant is a statement about that shape. Read it at the default, which is now a
+        // different tile, and the test would be asserting a coincidence the conversion no longer makes.
+        let reference = PearlMining {
+            m: 1024,
+            n: 1024,
+            k: 4096,
+            rank: 256,
+            rows_pattern: (0..16).collect(),
+            cols_pattern: (0..16).collect(),
+            gzip: false,
+        };
+        let th_per_second = reference.th_per_second(1e6);
         assert!(
             (th_per_second - (1u64 << 20) as f64 / 1e6).abs() < 1e-12,
-            "1 Mtile/s should be {} TH/s, got {th_per_second}",
+            "1 Mtile/s at the reference's shape should be {} TH/s, got {th_per_second}",
             (1u64 << 20) as f64 / 1e6
+        );
+
+        // And the same rate at the shape this miner runs: the tile is half the work, so the rate is half
+        // the constant. Asserting the half is what stops the conversion from being read as a rounding.
+        let split = PearlMining::default().th_per_second(1e6);
+        assert!(
+            (split - (1u64 << 19) as f64 / 1e6).abs() < 1e-12,
+            "1 Mtile/s at the split shape should be {} TH/s, got {split}",
+            (1u64 << 19) as f64 / 1e6
         );
     }
 
-    /// A tile is `16 * 16 * k` MACs, so the same tile rate at twice the GEMM depth is twice the
+    /// A tile is `h * w * k` MACs, so the same tile rate at twice the GEMM depth is twice the
     /// hashrate. That is what the depth in [`PearlMining::th_per_second`] buys over hardcoding the
     /// reference's `1 << 20`, which is only right at the depth the reference happens to use.
     #[test]
@@ -227,13 +261,24 @@ mod tests {
             deep.th_per_second(tiles_per_second)
         );
 
-        // The magnitude, which is the point of the change: 5e7 tiles/s is ~52 TH/s, so the ~56 TH/s
-        // the app reads on the dev box is ~5.3e7 tiles/s — and printing that tile rate as the
-        // hashrate put our figures three orders of magnitude from every other Pearl miner's.
+        // The magnitude at the shape this miner runs: 5e7 candidates/s at `2 * 128 * 2048` MACs each is
+        // 26.2144 TH/s. The same cell count as the old 16x16 tile — 256 cells either way — at half the
+        // depth, so half the work per candidate. Asserted rather than assumed, because the two shapes
+        // look different and price the same number of cells: only `k` separates them.
         assert!(
-            (base - 52.4288).abs() < 1e-3,
-            "5e7 tiles/s at the default depth is 52.4288 TH/s, got {base}"
+            (base - 26.2144).abs() < 1e-3,
+            "5e7 tiles/s at the default shape is 26.2144 TH/s, got {base}"
         );
+
+        let mut old_shape = PearlMining::default();
+        old_shape.rows_pattern = (0..16).collect();
+        old_shape.cols_pattern = (0..16).collect();
+        assert!(
+            (old_shape.th_per_second(tiles_per_second) - base).abs() < base * 1e-12,
+            "the same cell count at the same depth must price the same work: {base} then {}",
+            old_shape.th_per_second(tiles_per_second)
+        );
+
         assert_eq!(PearlMining::default().th_per_second(0.0), 0.0);
     }
 
@@ -251,30 +296,54 @@ mod tests {
         let mining = PearlMining::default();
         let config = mining_configuration(&mining).unwrap();
 
-        // The patterns have to survive the conversion to `PeriodicPattern` as sixteen consecutive
-        // indices, not just as sixteen indices — the tile the GPU folds is sixteen *consecutive*
-        // rows, and a pattern that came back as the same sixteen values spread across the matrix
-        // would pass every check below and describe a different tile.
-        for (name, pattern) in [
-            ("rows", &config.rows_pattern),
-            ("cols", &config.cols_pattern),
+        // The patterns have to survive the conversion to `PeriodicPattern` as *consecutive* indices, not
+        // just as the same set of indices — a candidate is a window, and a pattern that came back as the
+        // same values spread across the matrix would pass every check below and describe a different
+        // candidate. The rows pattern is the two rows a candidate names inside the blob's 128-row tile;
+        // the cols pattern is the whole 128-column strip the blob folds for it.
+        for (name, pattern, size, period) in [
+            ("rows", &config.rows_pattern, 2u32, 2u32),
+            ("cols", &config.cols_pattern, 128u32, 128u32),
         ] {
             assert_eq!(
                 pattern.size(),
-                16,
-                "the {name} pattern must span a whole 16x16 tile"
+                size,
+                "the {name} pattern must span the candidate window the blob reports"
             );
             assert_eq!(
                 pattern.indices_with_offset(0),
-                (0..16).collect::<Vec<u32>>(),
-                "the {name} pattern must be sixteen consecutive indices from offset zero"
+                (0..size).collect::<Vec<u32>>(),
+                "the {name} pattern must be consecutive indices from offset zero"
             );
+            // A pattern that slid by its own length instead of by the offset would report the same indices
+            // for every candidate, and the proof would describe the first window in the tile rather than
+            // the one the blob folded.
             assert_eq!(
-                pattern.indices_with_offset(48),
-                (48..64).collect::<Vec<u32>>(),
-                "the {name} pattern must slide by whole tiles, not by sixteen bytes"
+                pattern.indices_with_offset(24 * period),
+                (24 * period..24 * period + size).collect::<Vec<u32>>(),
+                "the {name} pattern must slide by the offset, not by its own length"
+            );
+            assert!(
+                pattern.offset_is_valid(24 * period),
+                "a whole number of periods must be a valid offset for the {name} pattern"
             );
         }
+
+        // An offset inside the window is not a valid offset at all, and the two patterns cannot be checked
+        // with one number. Both are stride 1, so `offset_is_valid` accepts only whole periods — which is
+        // exactly what `assemble` reports, `2 * cand` for the rows and `tile_n * 128` for the cols. For the
+        // rows pattern 48 is a whole number of 2-row periods; for the cols pattern the window *is* the
+        // period, so 48 is inside it and the verifier would reject a proof that named it. Asserting the
+        // rejection is what says the miner's offsets have to be tile-aligned, not merely inside a tile.
+        assert!(config.rows_pattern.offset_is_valid(48), "48 is a whole number of 2-row periods");
+        assert!(
+            !config.cols_pattern.offset_is_valid(48),
+            "48 is inside the 128-column window, so it is not a valid offset for the cols pattern"
+        );
+        assert!(
+            config.cols_pattern.offset_is_valid(128),
+            "the tile-aligned offset the miner reports must be valid"
+        );
 
         let public = PublicProofParams::new_dummy(
             IncompleteBlockHeader {
@@ -296,6 +365,122 @@ mod tests {
 
         assert_eq!(public.mining_config.common_dim, mining.k as u32);
         assert_eq!(public.mining_config.rank, mining.rank);
+    }
+
+    /// Gate E: the configuration the split search path needs, checked against the verifier rather
+    /// than assumed from the reference's defaults.
+    ///
+    /// Two things here are exercised rather than asserted, because both are the kind of thing a
+    /// reasonable-looking assumption gets wrong:
+    ///   * `PeriodicPattern::from_list` on a two-element list. Its periodicity loop runs
+    ///     `for period in 1..p.len()`, so a two-element list has exactly one candidate period, and the
+    ///     pattern is accepted only if that period divides out — which `[0, 1]` does, but `[0, 2]`
+    ///     would describe a different shape. `offset_is_valid` is a separate constraint from the shape.
+    ///   * the difficulty consequence. The split path's tile is `2 x 128`, not `16 x 16`: the same 256
+    ///     cells, but the dot product length is 2048 instead of 4096, so the adjustment factor the pool
+    ///     prices work by halves. That is not cosmetic — it changes the share rate at a given hashrate,
+    ///     and it is the reason this configuration cannot be adopted quietly.
+    #[test]
+    #[cfg(feature = "pearl")]
+    fn the_mining_configuration_the_split_path_requires_is_the_one_the_verifier_accepts() {
+        // Exercised, not assumed: a two-element list is the smallest case the periodicity loop can
+        // accept, and it has to round-trip through `to_bytes` to be a pattern a proof can carry.
+        let rows = list_to_pattern(&[0, 1]).expect("[0, 1] should be a pattern").0;
+        assert_eq!(rows.size(), 2);
+        assert_eq!(rows.indices_with_offset(0), vec![0, 1]);
+        assert!(rows.is_valid(), "a two-element pattern must round-trip through serialization");
+        assert!(rows.offset_is_valid(0), "offset 0 must be valid for the rows pattern");
+
+        let cols = list_to_pattern(&(0..128).collect::<Vec<u32>>())
+            .expect("0..128 should be a pattern")
+            .0;
+        assert_eq!(cols.size(), 128);
+        assert_eq!(cols.indices_with_offset(0), (0..128).collect::<Vec<u32>>());
+        assert!(cols.is_valid());
+        assert!(cols.offset_is_valid(0));
+
+        let split = PearlMining {
+            m: 128,
+            n: 256, // two tiles, so the grid reaches more than one candidate
+            k: 2048,
+            rank: 128,
+            rows_pattern: vec![0, 1],
+            cols_pattern: (0..128).collect(),
+            gzip: false,
+        };
+        let config = mining_configuration(&split).unwrap();
+        let public = PublicProofParams::new_dummy(
+            IncompleteBlockHeader {
+                version: 0,
+                prev_block: [0; 32],
+                merkle_root: [0; 32],
+                timestamp: 0,
+                nbits: 0,
+            },
+            SeedDerivation::Salted,
+            config,
+            split.m as u32,
+            split.n as u32,
+            0,
+            0,
+        );
+        sanity_checks::public_params_sanity_check(&public)
+            .expect("the split path's configuration must survive the verifier's own check");
+
+        // The derivation, stated as the coincidence it is. `k >= 16r` is the verifier's bound; the blob
+        // writes `JACKPOT_SIZE` checkpoints per candidate, one per `r`-sized group, so `k / r` can be at
+        // most 16. Both bounds meet at exactly one value when `r = 128`.
+        assert_eq!(config.rank as usize, sanity_checks::PENALTY_BASE_RANK);
+        assert_eq!(
+            config.dot_product_length(),
+            2048,
+            "the dot product length must be the whole k, not k rounded down to a rank multiple"
+        );
+        assert_eq!(
+            config.dot_product_length() / config.rank as usize,
+            zk_pow::circuit::pearl_program::JACKPOT_SIZE,
+            "each candidate's checkpoint slots must be written exactly once"
+        );
+
+        // The shipped default *is* now this configuration, so the assertion that used to say the default
+        // was not runnable has to compare against the shape it replaced instead. Both are fold-valid —
+        // 256 cells either way, `k = 16r` either way — so what rules the old shape out is the group size,
+        // not the fold: the blob checkpoints 128 columns per group and rank 256 groups twice that.
+        assert_eq!(PearlMining::default().rank as usize, 128, "the shipped default is the split configuration");
+
+        let replaced = PearlMining {
+            m: split.m,
+            n: split.n,
+            k: 4096,
+            rank: 256,
+            rows_pattern: (0..16).collect(),
+            cols_pattern: (0..16).collect(),
+            gzip: false,
+        };
+        assert_eq!(
+            replaced.k / replaced.rank as usize,
+            zk_pow::circuit::pearl_program::JACKPOT_SIZE,
+            "the shape this default replaced was fold-valid too, which is why the group size is the only \
+             thing that rules it out"
+        );
+
+        // The consequence, not hidden: the same 256 cells at half the depth is half the adjustment
+        // factor, so the pool's share target is met at half the work per share.
+        const NBITS: u32 = 0x1d00ffff;
+        let replaced_config = mining_configuration(&replaced).unwrap();
+        let split_factor = config.rows_pattern.size() as usize
+            * config.cols_pattern.size() as usize
+            * config.dot_product_length();
+        let replaced_factor = replaced_config.rows_pattern.size() as usize
+            * replaced_config.cols_pattern.size() as usize
+            * replaced_config.dot_product_length();
+        assert_eq!(split_factor, 256 * 2048);
+        assert_eq!(replaced_factor, 256 * 4096);
+        assert_eq!(
+            sanity_checks::extract_difficulty_bound(NBITS, &config),
+            sanity_checks::extract_difficulty_bound(NBITS, &replaced_config) / 2,
+            "the split path's share difficulty must be exactly half the shape it replaced's"
+        );
     }
 
     /// The proof-level version of the check above: a real proof at the shipped dimensions, parsed

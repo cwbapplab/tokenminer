@@ -1,6 +1,7 @@
 fn main() {
     tauri_build::build();
     build_cuda_kernels();
+    build_fatbin();
     build_pearl_gemm_extension();
 }
 
@@ -49,11 +50,7 @@ fn build_cuda_kernels() {
     // env change is declared here because a switch flipped without a rebuild does nothing, and a stale
     // cubin reads as a measurement.
     println!("cargo:rerun-if-env-changed=PEARL_NVCC_DEFINES");
-    let defines: Vec<String> = std::env::var("PEARL_NVCC_DEFINES")
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(String::from)
-        .collect();
+    let defines = nvcc_defines();
 
     let Some(nvcc) = find_nvcc() else {
         println!(
@@ -149,6 +146,125 @@ fn build_arches(
 fn write_empty_cubins(out_dir: &std::path::Path) {
     for arch in ARCHES {
         let _ = std::fs::write(out_dir.join(format!("kernels.{arch}.cubin")), []);
+    }
+}
+
+/// The compile-time geometry switches, read the same way for every nvcc invocation.
+fn nvcc_defines() -> Vec<String> {
+    std::env::var("PEARL_NVCC_DEFINES")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(String::from)
+        .collect()
+}
+
+/// The architectures the fatbin carries SASS for.
+///
+/// Unlike the cubins this is **one image for every card**: `cuModuleLoadData` picks the SASS entry
+/// that matches the device, and falls back to the `compute_86` PTX when none matches. So this list is
+/// not the set of GPUs the client can mine on the way the cubin list is — a card above `sm_86` runs
+/// through the driver JIT, and a card below it has nothing to load at all. `sm_75` is in the cubin
+/// table but cannot be in this one, because PTX is forward-compatible only.
+const FATBIN_ARCHES: &[&str] = &["sm_86", "sm_89", "sm_120"];
+
+/// The PTX the driver JITs when no SASS entry matches the device.
+const FATBIN_PTX: &str = "compute_86";
+
+/// Compiles the split search path's kernels into one multi-arch fatbin, into `OUT_DIR` where
+/// `fatbin.rs` embeds it.
+///
+/// This is the reference's `csrc/build_fatbin.sh`, moved into the build script so the image is
+/// embedded in the binary instead of loaded from a file at runtime.
+///
+/// Toolchain policy matches the cubins: an absent toolchain warns and writes an empty image, a
+/// present one that cannot compile fails the build. The difference is that this image is now the only
+/// search path, so an empty fatbin is a miner that never starts rather than a client with no GPU in
+/// it — which is exactly why a present-but-failing toolchain has to be loud.
+///
+/// One consequence of the single-image shape: the whole build needs a toolkit that knows `sm_120`, so
+/// a toolkit older than CUDA 12.4 fails here even on a machine holding a 4090. The crate already
+/// assumes 12.4 (`cudarc`'s `cuda-12040` feature), so that is not a new requirement — it is the same
+/// one, now enforced at compile time rather than at the first launch.
+fn build_fatbin() {
+    let out_dir = std::path::PathBuf::from(
+        std::env::var("OUT_DIR").expect("cargo always sets OUT_DIR for build scripts"),
+    );
+    let manifest = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("cargo always sets CARGO_MANIFEST_DIR"),
+    );
+    let kernels = manifest.join("src/miners/gpu/kernels");
+    let unit = kernels.join("kernels_only.cu");
+    let out = out_dir.join("pearl_gemm.fatbin");
+
+    // Listed one by one, as the cubins are: a header edited after the last build leaves a stale
+    // image, and a stale image reads at launch exactly like a fresh one.
+    for source in [
+        "kernels_only.cu",
+        "extern_c_shims.inc",
+        "pearl_gemm/blake3_sm80.cuh",
+        "pearl_gemm/noise_generation_sm80.cuh",
+        "pearl_gemm/pearl_blake3_compare_sm80.cuh",
+        "pearl_gemm/pow_scan_emit_sm80.cuh",
+    ] {
+        println!("cargo:rerun-if-changed={}", kernels.join(source).display());
+    }
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=PEARL_NVCC_DEFINES");
+
+    let Some(nvcc) = find_nvcc() else {
+        println!(
+            "cargo:warning=nvcc not found: no fatbin will be embedded, so the split search path \
+             has no kernels to run. Install the CUDA toolkit and rebuild."
+        );
+        let _ = std::fs::write(&out, []);
+        return;
+    };
+
+    // Windows only: nvcc shells out to `cl.exe` even for a device-only image. Whether `-fatbin`
+    // actually needs it is not settled — it emits no host code — so passing it when it is found is
+    // the safe reading, and the policy for a machine that has no `cl.exe` is the same as the cubins'.
+    let host_compiler = if cfg!(windows) { find_msvc_cl() } else { None };
+    if cfg!(windows) && host_compiler.is_none() {
+        println!(
+            "cargo:warning=no MSVC host compiler (cl.exe) found: no fatbin will be embedded. \
+             Install the Visual Studio C++ build tools and rebuild."
+        );
+        let _ = std::fs::write(&out, []);
+        return;
+    }
+
+    let mut command = std::process::Command::new(nvcc);
+    command.args([
+        "-O3",
+        "-std=c++17",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+    ]);
+    command.arg("-I").arg(kernels.join("pearl_gemm"));
+    for arch in FATBIN_ARCHES {
+        let ptx = format!("compute_{}", arch.trim_start_matches("sm_"));
+        command.arg("-gencode").arg(format!("arch={ptx},code={arch}"));
+    }
+    command.arg("-gencode")
+        .arg(format!("arch={FATBIN_PTX},code={FATBIN_PTX}"));
+    if let Some(host_compiler) = host_compiler.as_deref() {
+        command.arg("-ccbin").arg(host_compiler);
+    }
+    for define in nvcc_defines() {
+        command.arg(define);
+    }
+
+    match command.arg("-fatbin").arg("-o").arg(&out).arg(&unit).status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!(
+            "nvcc could not build the fatbin (exit {status}), so the client would build with no \
+             search kernels at all. Its diagnostics are above. The build needs a toolkit that knows \
+             sm_120 (CUDA 12.4+); if this machine genuinely has no CUDA toolkit, remove it from PATH \
+             and unset CUDA_PATH instead — a toolchain that is absent is handled without failing the \
+             build."
+        ),
+        Err(error) => panic!("could not run nvcc for the fatbin: {error}"),
     }
 }
 
