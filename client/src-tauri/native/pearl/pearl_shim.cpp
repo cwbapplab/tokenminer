@@ -81,6 +81,9 @@ struct PearlFfiHandle {
   // until the next call. `ok` is what the last call returned.
   PearlSearchResult last;
   int ok = 0;
+  // The region count of the last collect, set on every collect (hit or not) so a
+  // caller can count finished batches instead of hits.
+  int64_t last_regions = -1;
 };
 
 namespace {
@@ -241,8 +244,16 @@ int pearl_ffi_collect(PearlFfiHandle *h, PearlHitFlat *out, char *err, size_t er
   bool ok = pearl_host_collect(h->ctx, &h->last, &attempts, err, err_len);
   if (!ok && err && err_len && err[0]) return -1;
   h->ok = ok ? 1 : 0;
+  // `attempts` is filled even when collect reports no hit, so record it either
+  // way; a caller counting finished work needs the misses too.
+  h->last_regions = (int64_t)attempts;
   if (ok) publish(h, out, attempts);
   return h->ok;
+}
+
+int64_t pearl_ffi_last_regions(PearlFfiHandle *h) {
+  if (!h) return -1;
+  return h->last_regions;
 }
 
 int pearl_ffi_pending(PearlFfiHandle *h) {

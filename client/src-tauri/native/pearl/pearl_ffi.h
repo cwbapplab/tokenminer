@@ -125,6 +125,15 @@ int pearl_ffi_search(PearlFfiHandle *h, uint64_t nonce_base, uint32_t batch,
 int pearl_ffi_submit(PearlFfiHandle *h, uint64_t nonce_base, uint32_t batch,
                      uint64_t *regions_out, char *err, size_t err_len);
 int pearl_ffi_collect(PearlFfiHandle *h, PearlHitFlat *out, char *err, size_t err_len);
+// The region count of the most recent pearl_ffi_collect, whether or not it hit.
+//
+// The core only hands `attempts` back through its hit result, but a batch that
+// found nothing is exactly as much work as one that did, and it is the common
+// case at a pool's share difficulty — so a hashrate counted from hits alone
+// reads near zero while the card is fully busy. The shim records the count on
+// the collect itself (it is valid even when collect returned 0) so the caller can
+// count *finished* batches. Negative or unset before the first collect.
+int64_t pearl_ffi_last_regions(PearlFfiHandle *h);
 int pearl_ffi_pending(PearlFfiHandle *h);
 // The collected batch's further hits, one per call, after the one collect
 // returned. 1 = hit, 0 = no more, -1 = error.

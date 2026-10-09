@@ -130,6 +130,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     fn pearl_ffi_pending(h: *mut PearlFfiHandle) -> c_int;
+    fn pearl_ffi_last_regions(h: *mut PearlFfiHandle) -> i64;
     fn pearl_ffi_next_hit(h: *mut PearlFfiHandle, out: *mut PearlHitFlat) -> c_int;
     fn pearl_ffi_fold_name(h: *mut PearlFfiHandle) -> *const c_char;
 }
@@ -318,14 +319,16 @@ impl NativeCore {
         }
     }
 
-    /// Wait for the oldest queued batch.
-    pub fn collect(&mut self) -> Result<Option<(Hit, u64)>, String> {
+    /// Wait for the oldest queued batch. `Some(hit)` when it found a share. The
+    /// batch's region count is read separately via [`NativeCore::last_regions`],
+    /// because it is meaningful on a miss too.
+    pub fn collect(&mut self) -> Result<Option<Hit>, String> {
         let mut out: PearlHitFlat = unsafe { std::mem::zeroed() };
         let (mut err, err_len) = err_buf();
         let rc =
             unsafe { pearl_ffi_collect(self.handle, &mut out, err.as_mut_ptr(), err_len) };
         match rc {
-            1 => Ok(Some((unsafe { copy_hit(&out) }, out.attempts))),
+            1 => Ok(Some(unsafe { copy_hit(&out) })),
             0 => Ok(None),
             _ => Err(read_err(&err).unwrap_or_else(|| "CUDA collect failed".into())),
         }
@@ -339,6 +342,21 @@ impl NativeCore {
             Some(unsafe { copy_hit(&out) })
         } else {
             None
+        }
+    }
+
+    /// Region count of the most recent [`NativeCore::collect`], hit or miss.
+    ///
+    /// The core hands this back only through its hit result, so a caller reading
+    /// it from `collect`'s return alone counts just the batches that found a
+    /// share — which at a pool's difficulty is close to none of them, and makes a
+    /// busy card look idle. `None` before the first collect.
+    pub fn last_regions(&self) -> Option<u64> {
+        let n = unsafe { pearl_ffi_last_regions(self.handle) };
+        if n < 0 {
+            None
+        } else {
+            Some(n as u64)
         }
     }
 

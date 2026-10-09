@@ -215,9 +215,17 @@ impl GpuMiner {
             }
 
             queued -= 1;
+            // Count the batch whether or not it hit. The core sets `attempts` on
+            // every collect, so reading it inside the hit arm above counted only
+            // the batches that found a share — at a pool's difficulty almost none
+            // of them — which made a fully busy card report a hashrate near zero.
+            // One batch is a fixed number of regions, so this counts the work of
+            // every finished batch, exactly what the reference's `collect` does.
             match self.core.collect() {
-                Ok(Some((hit, attempts))) => {
-                    self.tiles += attempts;
+                Ok(Some(hit)) => {
+                    if let Some(regions) = self.core.last_regions() {
+                        self.tiles += regions;
+                    }
                     // A batch can hold more than one hit; each is its own share.
                     let mut hits = vec![hit];
                     while let Some(more) = self.core.next_hit() {
@@ -232,7 +240,11 @@ impl GpuMiner {
                         return Ok(Some(share));
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if let Some(regions) = self.core.last_regions() {
+                        self.tiles += regions;
+                    }
+                }
                 Err(error) => return Err(error),
             }
 
@@ -428,7 +440,7 @@ fn run_startup_gate(core: &mut NativeCore, profile: &Profile) -> Result<(), Stri
             // `submit` reports an error rather than a zero-width batch, so a
             // successful call always advances by at least one region.
             let batch = core.submit(nonce, 0)?;
-            if let Some((found, _)) = core.collect()? {
+            if let Some(found) = core.collect()? {
                 hit = Some(found);
                 break;
             }
@@ -676,6 +688,48 @@ mod tests {
             encoded(&second),
             "the second search re-reported the region the first already sent — the region cursor \
              is not advancing, so the pool is being fed the same share over and over"
+        );
+    }
+
+    /// Work that finds no share must still count.
+    ///
+    /// The core reports a batch's region count on the collect itself, hit or not,
+    /// but the shim surfaced it only alongside a hit — so the driver counted just
+    /// the batches that produced a share, which at a pool's difficulty is close to
+    /// none of them. A card at full tilt then reported a hashrate near zero while
+    /// the log filled with shares.
+    ///
+    /// The bound is 1, which admits essentially no jackpot, so the search runs its
+    /// whole slice without a hit: if the misses are not counted, `tiles` does not
+    /// move off zero.
+    ///
+    ///     cargo test --features pearl -- --ignored counts
+    #[test]
+    #[ignore = "opens the GPU, allocates a gigabyte context, and searches; run on the dev box"]
+    fn a_slice_of_misses_still_counts_as_work() {
+        let mut miner = GpuMiner::open(PearlMining::default())
+            .expect("the shipped profile must open on the dev box's card");
+
+        let header = IncompleteBlockHeader {
+            version: 0x2000_0000,
+            prev_block: [0x55; 32],
+            merkle_root: [0x66; 32],
+            timestamp: 1_700_000_002,
+            nbits: 0,
+        };
+
+        let before = miner.tiles();
+        let found = miner
+            .search(&header, 3, U256::one(), &|| false)
+            .expect("the search must not fault");
+        assert!(
+            found.is_none(),
+            "a bound of 1 admits no jackpot, so this slice must find nothing"
+        );
+        assert!(
+            miner.tiles() > before,
+            "a full slice of misses counted no work (tiles stayed at {before}) — the hashrate \
+             would read zero on a busy card"
         );
     }
 
