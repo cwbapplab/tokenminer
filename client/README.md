@@ -13,11 +13,17 @@ the Rust backend (`client/src-tauri`):
   crate plus the CPU/GPU/CUDA engines, driven in-process via
   `miner_service::run(ServiceConfig)`. Live status is read from the miner's
   Prometheus exporter.
-- **Pearl** (`miners/pearl`, ISC) — the Rust crates behind `py-pearl-mining`
-  (`zk-pow` + `pearl-blake3`). The Python/pyo3 shim is dropped; its API is
-  reimplemented natively in `src-tauri/src/miners/pearl.rs`. Scope note: the
-  native path proves/verifies and can run a naive CPU search; production GPU
-  mining lives in Pearl's Python/CUDA stack and is out of scope.
+- **Pearl** — two pieces, both in-process. The **proof layer** is the Rust crates
+  behind `py-pearl-mining` (`miners/pearl`, ISC: `zk-pow` + `pearl-blake3`); the
+  Python/pyo3 shim is dropped. The **search** is the CUDA core from the
+  `vendor/llmjob` submodule (`earn/native/src/pearl_*.cu`), compiled from source
+  by `src-tauri/build.rs` and driven over a flat C ABI (`src-tauri/native/pearl/`
+  shim, `src-tauri/src/miners/pearl/` engine). The engine mines, assembles the
+  `PlainProof` and re-verifies it with `zk-pow` before it goes on the wire.
+
+  Requires the CUDA toolkit (nvcc) and MSVC at build time for the arches
+  `75/80/86/89/90a/120`; without them the build warns and the client reports GPU
+  unavailable at runtime rather than failing to compile.
 
 Feature flags gate each engine (both are heavy builds):
 
@@ -52,8 +58,11 @@ src/                React app (Tailwind, no UI kit)
   components/       Tailwind UI kit + app shell (Able Pro-style)
   pages/            Login, Dashboard, Miners, Analytics, Settings
 src-tauri/          Rust backend
-  src/miners/       quantus.rs, pearl.rs, manager + commands
+  src/miners/       quantus.rs, pearl/ (engine, abi, config, proof, target), manager + commands
+  native/pearl/     flat C ABI shim + ABI check over the vendored llmjob CUDA core
   capabilities/     Tauri v2 permissions (http, deep-link, store, …)
+
+vendor/llmjob/      submodule: the upstream Pearl CUDA core, built from source
 ```
 
 ## Notes / follow-ups

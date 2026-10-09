@@ -34,11 +34,7 @@ pub mod quantus {
 #[cfg(feature = "pearl")]
 pub mod pearl;
 #[cfg(feature = "pearl")]
-pub mod pearl_gpu;
-#[cfg(feature = "pearl")]
 pub mod pearl_mining;
-#[cfg(feature = "pearl")]
-pub mod pearl_pow;
 #[cfg(not(feature = "pearl"))]
 pub mod pearl {
     //! Fallback when the `pearl` feature is not enabled.
@@ -58,11 +54,6 @@ pub mod pearl {
 }
 
 pub mod command;
-// Gated with the miner that uses it rather than left to compile on its own: the GPU backend, the
-// embedded cubins and the self-test kernels exist to serve Pearl and nothing else reaches them, so
-// a build without the feature would carry the lot as dead code.
-#[cfg(feature = "pearl")]
-pub mod gpu;
 
 /// Which mining backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

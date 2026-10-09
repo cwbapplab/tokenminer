@@ -96,7 +96,7 @@ export function SettingsPage() {
             {/* Read-only: the search runs entirely on the GPU, so there is no thread count to
                 choose. The dimensions are fixed at what the pools price shares against, and the
                 engine refuses anything else — shown here because a refused start names them. */}
-            <ReadOnlyField label="Matrix dimensions" value="131072 x 131072 x 4096, rank 256" />
+            <ReadOnlyField label="Matrix dimensions" value="131072 x 262144 x 2048, rank 128" />
             <ReadOnlyField label="Hash tile" value="16 x 16" />
           </div>
         </Card>

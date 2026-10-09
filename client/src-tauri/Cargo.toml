@@ -51,6 +51,10 @@ miner-metrics = { package = "metrics", path = "../miners/quantus-miner/crates/me
 # --- Pearl miner (native, in-process; the Rust crates behind py-pearl-mining) ---
 zk-pow = { path = "../miners/pearl/zk-pow", default-features = false, optional = true }
 pearl-blake3 = { path = "../miners/pearl/pearl-blake3", features = ["serde"], optional = true }
+# `job_key = blake3(header ‖ config52)` is the one hash the Rust side computes
+# itself. Same crate and version `pearl-blake3` re-exports, so the two agree by
+# construction rather than by both happening to be 1.8.
+blake3 = { version = "1.8", optional = true }
 # `zk-pow`'s public API speaks `primitive_types::U256`, so we have to match its 0.12 line for the
 # types to unify. Quantus pulls 0.13 separately; the two never meet.
 primitive-types = { version = "0.12", optional = true }
@@ -83,7 +87,7 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 [features]
 default = ["quantus", "pearl"]
 quantus = ["dep:miner-service", "dep:quic-transport", "dep:miner-metrics"]
-pearl = ["dep:zk-pow", "dep:pearl-blake3", "dep:primitive-types"]
+pearl = ["dep:zk-pow", "dep:pearl-blake3", "dep:primitive-types", "dep:blake3"]
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

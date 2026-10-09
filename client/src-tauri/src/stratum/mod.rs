@@ -6,8 +6,9 @@
 //! **before** the authorize ack, and `mining.submit {job_id, plain_proof}`.
 //!
 //! Framing/parsing comes from `sp-protocol` — the proxy's own crate — so the wire format
-//! cannot drift. Proofs are produced by [`crate::miners::pearl_gpu`] and encoded by
-//! [`crate::miners::pearl_mining`].
+//! cannot drift. The search is llmjob's vendored CUDA core, driven by
+//! [`crate::miners::pearl::GpuMiner`]; proofs are assembled and encoded by
+//! [`crate::miners::pearl`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -503,9 +504,9 @@ async fn run(
 /// The search thread: takes the current job, mines it against the job's *share* target on the GPU,
 /// and hands any solution to the writer.
 fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
-    use crate::miners::pearl_gpu::GpuMiner;
+    use crate::miners::pearl::GpuMiner;
     use crate::miners::pearl_mining;
-    use crate::miners::pearl_pow;
+    use crate::miners::pearl::{encode_plain_proof, share_search, verify_share_locally};
 
     std::thread::spawn(move || {
         let mining = config.mining.clone();
@@ -560,7 +561,7 @@ fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
             // Mine against the pool's share target rather than the block difficulty committed in
             // the header: a share is by definition easier than a block, so the block bound would
             // reject every candidate the pool accepts.
-            let (share_target, bound) = match pearl_pow::share_search(&job.target, miner.mining()) {
+            let (share_target, bound) = match share_search(&job.target, miner.profile()) {
                 Ok(pair) => pair,
                 Err(error) => {
                     if unusable_job.as_deref() != Some(job.job_id.as_str()) {
@@ -638,7 +639,7 @@ fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
             // The pool re-verifies everything we send. So do we, first — a proof that fails here
             // is a bug in the GPU path, and submitting it would only burn pool goodwill.
             if let Err(error) =
-                pearl_pow::verify_share_locally(&header, cert_version, &proof, share_target)
+                verify_share_locally(&header, cert_version, &proof, share_target)
             {
                 shared.log(
                     "error",
@@ -648,7 +649,7 @@ fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
             }
 
             let gzip = shared.gzip.load(Ordering::SeqCst);
-            let encoded = match pearl_mining::encode_plain_proof(&proof, gzip) {
+            let encoded = match encode_plain_proof(&proof, gzip) {
                 Ok(encoded) => encoded,
                 Err(error) => {
                     shared.log("error", error);
