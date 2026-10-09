@@ -32,23 +32,6 @@ extern "C" __global__ void pearl_noise_gen_dense_int8_R128(
   pearl::sm80::noise_gen::dense_int8_chunk<R>(chunk, key_r, seed_r, out);
 }
 
-// Block 128. Grid = ceil((rows * 128 / 32) / 128). Same geometry as the int8 form.
-extern "C" __global__ void pearl_noise_gen_dense_fp16_R128(
-    int rows,
-    const uint32_t* __restrict__ key,
-    const uint32_t* __restrict__ seed,
-    int32_t scale_factor,
-    __half* __restrict__ out) {
-  constexpr int R = 128;
-  const int chunk = blockIdx.x * blockDim.x + threadIdx.x;
-  if (chunk >= (rows * R) / 32) return;
-
-  uint32_t key_r[8], seed_r[8];
-  #pragma unroll
-  for (int i = 0; i < 8; ++i) { key_r[i] = key[i]; seed_r[i] = seed[i]; }
-  pearl::sm80::noise_gen::dense_fp16_chunk<R>(chunk, key_r, seed_r, scale_factor, out);
-}
-
 // Block 128. Grid = ceil(((k + 7) / 8) / 128). Output must be zeroed before every launch: this
 // entry point patches two non-zeros per row and never clears the previous attempt's.
 extern "C" __global__ void pearl_noise_gen_sparse_R128(

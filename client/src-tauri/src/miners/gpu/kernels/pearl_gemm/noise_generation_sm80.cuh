@@ -127,39 +127,6 @@ __device__ inline void dense_int8_chunk(int chunk,
   }
 }
 
-template <int R>
-__device__ inline void dense_fp16_chunk(int chunk,
-                                        const uint32_t key[8],
-                                        const uint32_t seed[8],
-                                        int32_t scale_factor,
-                                        __half* __restrict__ out) {
-  static_assert(R % 32 == 0, "R must be multiple of 32");
-
-  uint32_t msg[16];
-  detail::make_message(seed, msg, /*slot=*/0,
-                       static_cast<uint32_t>(chunk + 1));
-
-  uint32_t cv[8];
-  detail::keyed_compress(key, msg, cv);
-
-  const int row = (chunk * 32) / R;
-  const int col0 = (chunk * 32) % R;
-  __half* out_row = out + row * R + col0;
-
-  #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    uint32_t w = cv[i];
-    #pragma unroll
-    for (int b = 0; b < 4; ++b) {
-      int8_t hb = static_cast<int8_t>(w & 0xff);
-      w >>= 8;
-      int32_t v = (static_cast<int32_t>(hb) + 128) % 64 - 32;
-      float scaled = static_cast<float>(v * scale_factor);
-      out_row[i * 4 + b] = __float2half(scaled);
-    }
-  }
-}
-
 // =============================================================================
 //   Sparse noise (EAR_R_major / EBL_R_major; the K-major form is the transpose)
 // =============================================================================

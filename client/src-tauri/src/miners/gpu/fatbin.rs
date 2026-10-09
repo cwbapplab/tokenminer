@@ -45,7 +45,6 @@ pub const MIN_COMPUTE_CAPABILITY: (i32, i32) = (8, 6);
 
 pub mod symbols {
     pub const NOISE_GEN_DENSE_INT8_R128: &str = "pearl_noise_gen_dense_int8_R128";
-    pub const NOISE_GEN_DENSE_FP16_R128: &str = "pearl_noise_gen_dense_fp16_R128";
     pub const NOISE_GEN_SPARSE_R128: &str = "pearl_noise_gen_sparse_R128";
     pub const BLAKE3_COMPARE: &str = "pearl_blake3_compare_kernel";
     pub const POW_SCAN_HITS: &str = "pearl_pow_scan_hits_kernel";
@@ -54,7 +53,6 @@ pub mod symbols {
 /// Every symbol the launch layer looks up, in the order the pipeline uses them.
 pub const ALL_SYMBOLS: &[&str] = &[
     symbols::NOISE_GEN_DENSE_INT8_R128,
-    symbols::NOISE_GEN_DENSE_FP16_R128,
     symbols::NOISE_GEN_SPARSE_R128,
     symbols::BLAKE3_COMPARE,
     symbols::POW_SCAN_HITS,
@@ -98,10 +96,9 @@ fn ceil_div(a: usize, b: usize) -> usize {
 //   Load
 // =============================================================================
 
-/// The five entry points, resolved against the loaded image on a device.
+/// The four entry points, resolved against the loaded image on a device.
 pub struct FatbinKernels {
     pub noise_dense_int8: CudaFunction,
-    pub noise_dense_fp16: CudaFunction,
     pub noise_sparse: CudaFunction,
     pub blake3_compare: CudaFunction,
     pub pow_scan_hits: CudaFunction,
@@ -113,7 +110,7 @@ pub struct FatbinKernels {
 impl FatbinKernels {
     /// Loads the image and resolves every symbol.
     ///
-    /// Resolving all five up front is the point: a symbol that does not exist fails here, at load,
+    /// Resolving all of them up front is the point: a symbol that does not exist fails here, at load,
     /// with the name in the message. A launch layer that looked symbols up lazily would fail mid-
     /// pipeline, on the first attempt that reached that stage.
     pub fn load(ctx: &Arc<CudaContext>, cc: (i32, i32)) -> Result<Self, String> {
@@ -138,7 +135,6 @@ impl FatbinKernels {
 
         Ok(Self {
             noise_dense_int8: resolve(&module, symbols::NOISE_GEN_DENSE_INT8_R128)?,
-            noise_dense_fp16: resolve(&module, symbols::NOISE_GEN_DENSE_FP16_R128)?,
             noise_sparse: resolve(&module, symbols::NOISE_GEN_SPARSE_R128)?,
             blake3_compare: resolve(&module, symbols::BLAKE3_COMPARE)?,
             pow_scan_hits: resolve(&module, symbols::POW_SCAN_HITS)?,
