@@ -66,7 +66,7 @@ class ApiClient {
   private storage: TokenStorage = localStorageTokenStorage;
   private accessToken: string | null = null;
   private refreshToken: string | null = null;
-  private refreshInFlight: Promise<boolean> | null = null;
+  private refreshInFlight: Promise<RefreshOutcome> | null = null;
   private onUnauthorized: UnauthorizedHandler | null = null;
 
   constructor() {
@@ -146,9 +146,17 @@ class ApiClient {
     const response = await httpFetch(url, { ...init, headers });
 
     if (response.status === 401 && allowRetry && this.refreshToken) {
-      const refreshed = await this.refresh();
-      if (refreshed) {
+      const outcome = await this.refresh();
+
+      if (outcome === "ok") {
         return this.request<T>(path, init, false);
+      }
+
+      // The server could not be reached to refresh. The session is probably fine, so it is
+      // kept and the caller just sees a failure it can retry — signing the user out here is
+      // what turns a flaky moment into a trip back to the login screen.
+      if (outcome === "unreachable") {
+        throw new ApiError("Cannot reach the server. Check your connection and try again.", 0, null);
       }
     }
 
@@ -156,6 +164,7 @@ class ApiClient {
       const problem = await readProblem(response);
 
       if (response.status === 401) {
+        // Reaching here means the refresh token was rejected, not merely unreadable.
         this.clearTokens();
         this.onUnauthorized?.();
       }
@@ -167,41 +176,67 @@ class ApiClient {
   }
 
   /** Collapses concurrent refreshes so a page load does not fire one per request. */
-  private refresh(): Promise<boolean> {
+  private refresh(): Promise<RefreshOutcome> {
     if (this.refreshInFlight) {
       return this.refreshInFlight;
     }
 
     const token = this.refreshToken;
     if (!token) {
-      return Promise.resolve(false);
+      return Promise.resolve("rejected");
     }
 
-    this.refreshInFlight = (async () => {
-      try {
-        const url = `${loadSettings().apiBaseUrl.replace(/\/$/, "")}/api/auth/refresh`;
-        const response = await httpFetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify({ refreshToken: token }),
-        });
+    const attempt = this.performRefresh(token).finally(() => {
+      this.refreshInFlight = null;
+    });
 
-        if (!response.ok) {
-          return false;
-        }
+    this.refreshInFlight = attempt;
+    return attempt;
+  }
 
-        this.setTokens((await response.json()) as AuthTokens);
-        return true;
-      } catch {
-        return false;
-      } finally {
-        this.refreshInFlight = null;
-      }
-    })();
+  private async performRefresh(token: string): Promise<RefreshOutcome> {
+    let response: Response;
+    try {
+      const url = `${loadSettings().apiBaseUrl.replace(/\/$/, "")}/api/auth/refresh`;
+      response = await httpFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ refreshToken: token }),
+      });
+    } catch {
+      // Network error / timeout: the token was never judged, so the session stands.
+      return "unreachable";
+    }
 
-    return this.refreshInFlight;
+    if (!response.ok) {
+      // A rejection is a verdict on the token; anything else (5xx, gateway errors) is the
+      // server being unavailable and must not end the session.
+      return isRejection(response.status) ? "rejected" : "unreachable";
+    }
+
+    try {
+      this.setTokens((await response.json()) as AuthTokens);
+      return "ok";
+    } catch {
+      return "unreachable";
+    }
   }
 }
+
+/**
+ * Whether a status means "this token is no longer accepted" (end the session) rather than
+ * "the server could not answer" (keep it and retry later). Only an explicit authentication
+ * rejection qualifies — a 5xx or a malformed-request 400 says nothing about the token.
+ */
+function isRejection(status: number): boolean {
+  return status === 401 || status === 403;
+}
+
+/**
+ * The result of a refresh attempt. `rejected` is a real answer from the server that the
+ * refresh token is no longer valid; `unreachable` means no answer was obtained.
+ */
+type RefreshOutcome = "ok" | "rejected" | "unreachable";
 
 function serialize(body: unknown): string | undefined {
   return body === undefined ? undefined : JSON.stringify(body);

@@ -31,8 +31,35 @@ public interface IRefreshTokenStore
 
     Task<RefreshToken?> GetByHashAsync(string tokenHash, CancellationToken cancellationToken);
 
-    /// <summary>Every token for the user that is neither revoked nor expired.</summary>
-    Task<IReadOnlyList<RefreshToken>> GetActiveByUserAsync(Guid userId, CancellationToken cancellationToken);
+    /// <summary>
+    /// Atomically revokes a still-active token as part of a rotation.
+    /// </summary>
+    /// <returns>
+    /// <c>true</c> when this caller claimed the rotation, <c>false</c> when the token was
+    /// already revoked by a concurrent request. The write is issued as a conditional UPDATE so
+    /// the check and the claim cannot be split apart.
+    /// </returns>
+    Task<bool> TryRotateAsync(
+        Guid tokenId,
+        string reason,
+        DateTimeOffset now,
+        Guid replacedByTokenId,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Revokes every still-active token descended from <paramref name="tokenId"/> by following
+    /// the rotation chain, and returns how many were affected.
+    /// </summary>
+    /// <remarks>
+    /// This is how a replay is contained: the chain is one session, so terminating it shuts the
+    /// session down without touching the user's other devices. Walking the chain in the database
+    /// keeps it to a single statement and needs no per-hop round trip.
+    /// </remarks>
+    Task<int> RevokeSessionChainAsync(
+        Guid tokenId,
+        string reason,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
 }
 
 public interface IOtpStore

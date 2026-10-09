@@ -17,14 +17,16 @@ const LEVEL_COLORS: Record<string, string> = {
 };
 
 export function LogConsole({ lines, className }: { lines: LogLine[]; className?: string }) {
-  const endRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [lines.length]);
 
   return (
     <div
+      ref={scrollRef}
       className={cn(
         "scrollbar-slim h-64 overflow-y-auto rounded-lg bg-slate-950 p-3 font-mono text-xs leading-relaxed",
         className,
@@ -43,7 +45,6 @@ export function LogConsole({ lines, className }: { lines: LogLine[]; className?:
           </div>
         ))
       )}
-      <div ref={endRef} />
     </div>
   );
 }

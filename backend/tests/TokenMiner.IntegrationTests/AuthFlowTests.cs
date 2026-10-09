@@ -70,16 +70,52 @@ public sealed class AuthFlowTests(ApiFactory factory)
         var rotated = await refresh.Content.ReadFromJsonAsync<AuthTokensResponse>();
         rotated!.RefreshToken.Should().NotBe(tokens.RefreshToken);
 
+        // A second, independent sign-in so the reuse below has a bystander session to spare.
+        var second = await client.PostAsJsonAsync("/api/auth/login", new LoginRequest(email, ValidPassword));
+        second.StatusCode.Should().Be(HttpStatusCode.OK);
+        var secondTokens = await second.Content.ReadFromJsonAsync<AuthTokensResponse>();
+
         // Replaying the superseded token is treated as theft.
         var reuse = await client.PostAsJsonAsync("/api/auth/refresh", new RefreshTokenRequest(tokens.RefreshToken));
         reuse.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
 
-        // ...and that revokes every active token, including the freshly rotated one.
+        // The replay closes the session it came from: the token the replayed one rotated into.
         var afterReuse = await client.PostAsJsonAsync("/api/auth/refresh", new RefreshTokenRequest(rotated.RefreshToken));
         afterReuse.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
 
+        // ...but stops there. The other session is untouched, which is the property that keeps a
+        // shared account from logging every device out when one client replays an old token.
+        var bystander = await client.PostAsJsonAsync("/api/auth/refresh", new RefreshTokenRequest(secondTokens!.RefreshToken));
+        bystander.StatusCode.Should().Be(HttpStatusCode.OK);
+
         var login = await client.PostAsJsonAsync("/api/auth/login", new LoginRequest(email, ValidPassword));
         login.StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task ConcurrentRefreshes_OfTheSameToken_OnlyOneSucceeds()
+    {
+        var client = factory.CreateClient();
+        var email = NewEmail();
+
+        await client.PostAsJsonAsync("/api/auth/register", new RegisterRequest(email, ValidPassword, null));
+        await client.PostAsJsonAsync("/api/auth/verify-email", new VerifyEmailRequest(factory.Email.LatestVerificationToken(email)));
+        var activate = await client.PostAsJsonAsync(
+            "/api/auth/otp/verify",
+            new VerifyOtpRequest(email, factory.Email.LatestActivationCode(email)));
+        var tokens = await activate.Content.ReadFromJsonAsync<AuthTokensResponse>();
+
+        // Two clients hammer the same refresh token at once. Without an atomic rotation both would
+        // mint a pair and both would stay active; exactly one may win.
+        var first = factory.CreateClient();
+        var second = factory.CreateClient();
+
+        var responses = await Task.WhenAll(
+            first.PostAsJsonAsync("/api/auth/refresh", new RefreshTokenRequest(tokens!.RefreshToken)),
+            second.PostAsJsonAsync("/api/auth/refresh", new RefreshTokenRequest(tokens.RefreshToken)));
+
+        responses.Count(response => response.StatusCode == HttpStatusCode.OK).Should().Be(1);
+        responses.Count(response => response.StatusCode == HttpStatusCode.Unauthorized).Should().Be(1);
     }
 
     [Fact]

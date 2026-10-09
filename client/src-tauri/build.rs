@@ -19,8 +19,43 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    watch_bundle_icons();
     tauri_build::build();
     build_pearl_native();
+}
+
+/// Re-run when a bundled icon changes.
+///
+/// `tauri_build::build()` watches the config and the capabilities, but not the
+/// icon files: only its `codegen`-feature path emits those. The Windows resource
+/// library embeds `icons/icon.ico` during the build script, so without this an
+/// incremental rebuild relinks the executable against the icon it had last time
+/// it happened to re-run — a re-skinned app that still shows the old one until a
+/// full `cargo clean`.
+fn watch_bundle_icons() {
+    let manifest =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
+
+    // The icon list is read from the config rather than hardcoded, so a set that
+    // is trimmed here (the .icns is macOS-only, say) is still the set watched.
+    let config_path = manifest.join("tauri.conf.json");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", config_path.display()));
+    let config: serde_json::Value = serde_json::from_str(&config)
+        .unwrap_or_else(|e| panic!("could not parse {}: {e}", config_path.display()));
+
+    let icons = config
+        .get("bundle")
+        .and_then(|bundle| bundle.get("icon"))
+        .and_then(serde_json::Value::as_array)
+        .expect("tauri.conf.json has no `bundle.icon` array");
+
+    for icon in icons {
+        let icon = icon
+            .as_str()
+            .expect("every `bundle.icon` entry must be a string");
+        println!("cargo:rerun-if-changed={}", manifest.join(icon).display());
+    }
 }
 
 /// The compute capabilities to compile for, given a toolkit that knows them.

@@ -6,7 +6,9 @@ import { Spinner } from "./components/ui";
 import { ThemeProvider } from "./components/theme";
 import { ToastProvider, useToast } from "./components/Toast";
 import { AuthProvider, useAuth } from "./lib/auth";
+import { loadSettings } from "./lib/settings";
 import { isTauri } from "./lib/tauri";
+import { syncCloseToTray } from "./lib/window";
 import { LoginPage } from "./pages/LoginPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { MinersPage } from "./pages/MinersPage";
@@ -69,6 +71,26 @@ function DeepLinkHandler() {
   return null;
 }
 
+/**
+ * Pushes the persisted close-to-tray setting into the Rust backend once at boot.
+ *
+ * The backend defaults to enabled; if the user turned it off in a previous run,
+ * this is what makes the window close for real again. It runs regardless of auth
+ * so the setting takes effect even on the login screen.
+ */
+function CloseToTraySync() {
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+    void syncCloseToTray(loadSettings().closeToTray).catch(() => {
+      /* The default (enabled) stands if the sync cannot reach Rust. */
+    });
+  }, []);
+
+  return null;
+}
+
 function RequireAuth({ children }: { children: ReactNode }) {
   const { status } = useAuth();
   const location = useLocation();
@@ -94,6 +116,7 @@ export default function App() {
       <BrowserRouter>
         <AuthProvider>
           <ToastProvider>
+            <CloseToTraySync />
             <DeepLinkHandler />
             <Routes>
               <Route path="/login" element={<LoginPage />} />

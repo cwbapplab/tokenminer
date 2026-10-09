@@ -32,6 +32,12 @@ export interface AppSettings {
    * ambiguous case, which used to be hard-wired to Quantus.
    */
   defaultEngine: MinerKind;
+  /**
+   * When true, closing the main window hides it to the system tray and leaves the
+   * miners running; the app only quits from the tray menu. When false, closing
+   * quits and stops mining, as it did before this option existed.
+   */
+  closeToTray: boolean;
   quantus: QuantusSettings;
   pearl: PearlSettings;
 }
@@ -44,6 +50,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   apiBaseUrl: "http://192.168.1.2:5210",
   stratumEndpoint: "192.168.1.2:3333",
   defaultEngine: "pearl",
+  closeToTray: true,
   quantus: {
     nodeAddr: "127.0.0.1:9833",
     authTokenFile: "",
@@ -80,6 +87,10 @@ export function loadSettings(): AppSettings {
       // the merge and fail at session start as a Rust deserialization error, which reads as a broken
       // session rather than a bad setting.
       defaultEngine: isMinerKind(parsed.defaultEngine) ? parsed.defaultEngine : DEFAULT_SETTINGS.defaultEngine,
+      // Same reasoning as `defaultEngine`: a non-boolean would otherwise reach the
+      // Rust command and be rejected there, reading as a broken close handler.
+      closeToTray:
+        typeof parsed.closeToTray === "boolean" ? parsed.closeToTray : DEFAULT_SETTINGS.closeToTray,
       quantus: { ...DEFAULT_SETTINGS.quantus, ...parsed.quantus },
       pearl: { ...DEFAULT_SETTINGS.pearl, ...parsed.pearl },
     };

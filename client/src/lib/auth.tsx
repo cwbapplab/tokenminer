@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
-import { api } from "./api";
+import { api, ApiError } from "./api";
 import type { AuthTokens, PendingActivation, UserProfile } from "./types";
 
 export type AuthStatus = "loading" | "authenticated" | "anonymous";
@@ -25,6 +25,25 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 function isPendingActivation(value: unknown): value is PendingActivation {
   return typeof value === "object" && value !== null && "requiresActivation" in value;
+}
+
+/**
+ * Whether the server rejected the session outright, as opposed to being unreachable
+ * (status 0) or failing in some other way. Only an outright rejection should discard tokens.
+ */
+function isSessionRejection(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 401 || error.status === 403);
+}
+
+/** Boot-time profile retries: enough to ride out the API still starting up, not so many
+ *  that a genuinely dead backend keeps the app on the loading spinner. */
+const RESTORE_ATTEMPTS = 3;
+const RESTORE_RETRY_MS = 700;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -59,18 +78,43 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      try {
-        const profile = await api.get<UserProfile>("/api/auth/me");
-        if (!cancelled) {
+      // At launch the API may not be reachable yet (it starts alongside the app, or the
+      // machine's network is still coming up). A few spaced retries keep that transient
+      // failure from looking like a signed-out session.
+      for (let attempt = 0; attempt < RESTORE_ATTEMPTS; attempt++) {
+        try {
+          const profile = await api.get<UserProfile>("/api/auth/me");
+          if (cancelled) {
+            return;
+          }
           setUser(profile);
           setStatus("authenticated");
-        }
-      } catch {
-        if (!cancelled) {
-          api.clearTokens();
-          setStatus("anonymous");
+          return;
+        } catch (error) {
+          if (cancelled) {
+            return;
+          }
+
+          // A rejection is final — retrying cannot help, and the tokens are spent.
+          if (isSessionRejection(error)) {
+            api.clearTokens();
+            setStatus("anonymous");
+            return;
+          }
+
+          if (attempt < RESTORE_ATTEMPTS - 1) {
+            await delay(RESTORE_RETRY_MS * (attempt + 1));
+            if (cancelled) {
+              return;
+            }
+          }
         }
       }
+
+      // Still failing for a transient reason: show the login screen but keep the stored
+      // tokens, so the next launch can resume the session instead of asking for the
+      // password because the network blinked.
+      setStatus("anonymous");
     }
 
     void restore();

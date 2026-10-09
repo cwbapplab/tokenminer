@@ -16,9 +16,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# build.rs reads `bundle.icon` out of tauri.conf.json to know which files to
+# watch for changes; see `watch_bundle_icons`.
+serde_json = "1"
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon` is what lets the app keep mining with the window closed: it is the
+# only route back to the UI (and to Quit) once the window is hidden.
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-http = "2"
 tauri-plugin-log = "2"

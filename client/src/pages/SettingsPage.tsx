@@ -6,6 +6,7 @@ import { Button, Card, CardHeader } from "../components/ui";
 import { useToast } from "../components/Toast";
 import { getHardwareId } from "../lib/hardware";
 import { isTauri } from "../lib/tauri";
+import { syncCloseToTray } from "../lib/window";
 import { DEFAULT_SETTINGS, loadSettings, saveSettings, type AppSettings } from "../lib/settings";
 
 export function SettingsPage() {
@@ -39,12 +40,15 @@ export function SettingsPage() {
 
   function save() {
     saveSettings(settings);
+    // Push the close behaviour into Rust, where the window-close handler reads it.
+    void syncCloseToTray(settings.closeToTray);
     toast.push("success", "Settings saved.");
   }
 
   function reset() {
     setSettings(DEFAULT_SETTINGS);
     saveSettings(DEFAULT_SETTINGS);
+    void syncCloseToTray(DEFAULT_SETTINGS.closeToTray);
     toast.push("info", "Settings reset to defaults.");
   }
 
@@ -80,6 +84,22 @@ export function SettingsPage() {
               onChange={(value) => update("defaultEngine", value)}
             />
             <ReadOnlyField label="Hardware id" value={getHardwareId()} />
+          </div>
+        </Card>
+
+        <Card>
+          <CardHeader title="Window" subtitle="What closing the window does" />
+          <div className="space-y-2 px-5 py-4">
+            <ToggleField
+              label="Close to tray (keep mining)"
+              value={settings.closeToTray}
+              onChange={(value) => update("closeToTray", value)}
+            />
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              When on, closing the window sends TokenMiner to the system tray and mining keeps
+              running in the background. Reopen it from the tray icon, or choose <b>Quit</b> there to
+              stop mining and exit. When off, closing the window exits the app and stops mining.
+            </p>
           </div>
         </Card>
 
