@@ -4,3 +4,6 @@
 [submodule "client/miners/pearl"]
 	path = client/miners/pearl
 	url = https://github.com/cwbapplab/pearl.git
+[submodule "vendor/llmjob"]
+	path = vendor/llmjob
+	url = https://github.com/cwbapplab/llmjob.git
