@@ -73,6 +73,12 @@ export function SettingsPage() {
               value={settings.stratumEndpoint}
               onChange={(value) => update("stratumEndpoint", value)}
             />
+            <SelectField
+              label="Default engine (sessions that name neither coin)"
+              value={settings.defaultEngine}
+              options={["pearl", "quantus"]}
+              onChange={(value) => update("defaultEngine", value)}
+            />
             <ReadOnlyField label="Hardware id" value={getHardwareId()} />
           </div>
         </Card>
@@ -216,6 +222,31 @@ function ReadOnlyField({ label, value }: { label: string; value: string }) {
     <label className="block">
       <span className="mb-1 block text-xs font-medium text-slate-500 dark:text-slate-400">{label}</span>
       <input readOnly className={`${INPUT_CLASS} font-mono text-xs`} value={value} />
+    </label>
+  );
+}
+
+function SelectField<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: T;
+  options: readonly T[];
+  onChange: (value: T) => void;
+}) {
+  return (
+    <label className="block">
+      <span className="mb-1 block text-xs font-medium text-slate-500 dark:text-slate-400">{label}</span>
+      <select className={INPUT_CLASS} value={value} onChange={(e) => onChange(e.currentTarget.value as T)}>
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
     </label>
   );
 }

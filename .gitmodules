@@ -3,4 +3,4 @@
 	url = https://github.com/Quantus-Network/quantus-miner
 [submodule "client/miners/pearl"]
 	path = client/miners/pearl
-	url = https://github.com/pearl-research-labs/pearl
+	url = https://github.com/cwbapplab/pearl.git

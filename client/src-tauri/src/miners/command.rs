@@ -253,11 +253,17 @@ pub fn parse(command: &str) -> Result<MinerParams, String> {
 }
 
 /// Chooses the embedded engine for a session from the coin/algorithm, falling back
-/// to the program name (e.g. `...pearl...` → Pearl).
+/// to the program name (e.g. `...pearl...` → Pearl), and finally to `default`.
+///
+/// Both coins have to be recognised explicitly now that the last branch is a preference rather than
+/// a constant. `qtc` used to reach Quantus only because Quantus *was* the fallback, so a Pearl
+/// default with only Pearl listed would send every Quantus session to the Pearl engine the moment the
+/// default changed. The explicit sets are what keep a session on the engine its coin names.
 pub fn resolve_kind(
     coin_code: Option<&str>,
     algorithm_code: Option<&str>,
     program: &str,
+    default: MinerKind,
 ) -> MinerKind {
     let haystack = format!(
         "{} {} {}",
@@ -269,8 +275,10 @@ pub fn resolve_kind(
 
     if haystack.contains("prl") || haystack.contains("pearl") {
         MinerKind::Pearl
-    } else {
+    } else if haystack.contains("qtc") || haystack.contains("quantus") {
         MinerKind::Quantus
+    } else {
+        default
     }
 }
 
@@ -309,12 +317,38 @@ mod tests {
 
     #[test]
     fn resolves_kind_from_coin_and_program() {
-        assert_eq!(resolve_kind(Some("PRL"), None, "miner"), MinerKind::Pearl);
+        // Every case here names an engine, so each still resolves the same way whatever the default
+        // is -- that is the point of passing a default that disagrees with the answer.
         assert_eq!(
-            resolve_kind(None, Some("quantus"), "miner"),
+            resolve_kind(Some("PRL"), None, "miner", MinerKind::Quantus),
+            MinerKind::Pearl
+        );
+        assert_eq!(
+            resolve_kind(None, Some("quantus"), "miner", MinerKind::Pearl),
             MinerKind::Quantus
         );
-        assert_eq!(resolve_kind(None, None, "pearl-miner"), MinerKind::Pearl);
+        assert_eq!(
+            resolve_kind(None, None, "pearl-miner", MinerKind::Quantus),
+            MinerKind::Pearl
+        );
+        // `qtc` is the case the new default would have broken: it names the coin, not the engine, and
+        // used to resolve only through the fallback.
+        assert_eq!(
+            resolve_kind(Some("qtc"), None, "miner", MinerKind::Pearl),
+            MinerKind::Quantus
+        );
+    }
+
+    #[test]
+    fn ambiguous_sessions_use_the_default() {
+        assert_eq!(
+            resolve_kind(Some("XYZ"), Some("xyz"), "miner", MinerKind::Pearl),
+            MinerKind::Pearl
+        );
+        assert_eq!(
+            resolve_kind(Some("XYZ"), Some("xyz"), "miner", MinerKind::Quantus),
+            MinerKind::Quantus
+        );
     }
 
     #[test]

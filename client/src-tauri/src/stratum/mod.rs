@@ -153,7 +153,12 @@ struct Shared {
     /// Submit id -> job id, so a pool reply can be attributed.
     pending: Mutex<HashMap<u64, String>>,
     next_id: AtomicU64,
-    stop: AtomicBool,
+    /// Set by `stop_miner` (via the handle `spawn` hands back) to tell the
+    /// miner thread to unwind. An `Arc` rather than a bare `AtomicBool`
+    /// because the caller has to hold the same flag the thread polls —
+    /// aborting the reader task alone would leave the thread looping with
+    /// the device and its memory still held.
+    stop: Arc<AtomicBool>,
     /// Whether submits are gzipped. Decided by the authorize ack, not by configuration: pools
     /// negotiate it, and Kryptex's v2 session is accepted in an object rather than a `true`.
     gzip: AtomicBool,
@@ -236,13 +241,21 @@ fn update_status(
 }
 
 /// Runs the PRL session on a background task.
+///
+/// Returns the task handle alongside the session's stop signal. The caller
+/// stores the signal and sets it to stop: the miner thread is a plain OS
+/// thread that aborting the task cannot reach, so it has to observe the
+/// flag and exit on its own.
 pub fn spawn(
     app: AppHandle,
     config: PrlConfig,
     status: Arc<Mutex<MinerStatus>>,
-) -> tauri::async_runtime::JoinHandle<()> {
-    tauri::async_runtime::spawn(async move {
-        match run(&app, &config, &status).await {
+) -> (tauri::async_runtime::JoinHandle<()>, Arc<AtomicBool>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_run = stop.clone();
+
+    let handle = tauri::async_runtime::spawn(async move {
+        match run(&app, &config, &status, stop_for_run).await {
             Ok(()) => {
                 update_status(&app, &status, |s| {
                     s.state = MinerState::Stopped;
@@ -260,13 +273,16 @@ pub fn spawn(
                 emit_log(&app, MinerKind::Pearl, "error", error);
             }
         }
-    })
+    });
+
+    (handle, stop)
 }
 
 async fn run(
     app: &AppHandle,
     config: &PrlConfig,
     status: &Arc<Mutex<MinerStatus>>,
+    stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     emit_log(
         app,
@@ -293,7 +309,7 @@ async fn run(
         job: Mutex::new(None),
         pending: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
-        stop: AtomicBool::new(false),
+        stop,
         gzip: AtomicBool::new(config.mining.gzip),
         tx,
     });

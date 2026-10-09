@@ -7,8 +7,12 @@
 //! kernel itself. Today a backend's contract is that it loads its embedded image and computes the
 //! right answer on the device it found, which is what [`GpuBackend::self_test`] enforces.
 
+pub mod bufs;
 pub mod cubins;
 pub mod cuda;
+pub mod fatbin;
+pub mod pipeline;
+pub mod triton;
 
 use serde::Serialize;
 

@@ -318,20 +318,32 @@ mod tests {
             searched / hero_target()
         );
 
-        // The gap is exactly `rank / PENALTY_BASE_RANK`. The default configuration sits at
-        // rank 256, twice the base rank, so the two part company there and no separate
-        // configuration is needed to show it.
-        let penalised =
-            penalized_target_bound(hero_target(), &mining_configuration(&mining).unwrap()).unwrap();
+        // The gap is exactly `rank / PENALTY_BASE_RANK`. The shipped default now sits *at* the base rank,
+        // so it is the case where the two agree — asserted, because a default that silently carried a
+        // penalty would look like the unpenalised one. The parting needs a rank above the base, so this
+        // builds one rather than reading it off the default.
+        assert_eq!(
+            mining.rank as usize,
+            PENALTY_BASE_RANK,
+            "the shipped default sits at the base rank, so no penalty applies to it"
+        );
+
+        let above = PearlMining {
+            rank: 2 * PENALTY_BASE_RANK as u16,
+            ..PearlMining::default()
+        };
+        let above_config = mining_configuration(&above).unwrap();
+        let searched_above = share_bound(hero_target(), &above).unwrap();
+        let penalised = penalized_target_bound(hero_target(), &above_config).unwrap();
 
         assert_eq!(
-            searched,
-            penalised * (mining.rank as usize / PENALTY_BASE_RANK)
+            searched_above,
+            penalised * (above.rank as usize / PENALTY_BASE_RANK)
         );
         assert!(
-            searched > penalised,
+            searched_above > penalised,
             "at rank {} the unpenalised bound should be the wider of the two",
-            mining.rank
+            above.rank
         );
     }
 
