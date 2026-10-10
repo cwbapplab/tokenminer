@@ -2,8 +2,9 @@ using MediatR;
 using TokenMiner.Application.Authentication.Abstractions;
 using TokenMiner.Application.Authentication.Models;
 using TokenMiner.Application.Common.Exceptions;
+using TokenMiner.Application.Mining;
 using TokenMiner.Application.Mining.Abstractions;
-using TokenMiner.Domain.Mining.Enums;
+using TokenMiner.Application.Mining.Services;
 
 namespace TokenMiner.Application.Authentication.Queries;
 
@@ -54,7 +55,9 @@ internal sealed class GetAdminUserQueryHandler(
     IMiningSessionRepository sessions,
     IShareRepository shares,
     ICoinRepository coins,
-    IPoolRepository pools)
+    IPoolRepository pools,
+    MiningOptions miningOptions,
+    TimeProvider timeProvider)
     : IRequestHandler<GetAdminUserQuery, AdminUserDetailDto>
 {
     public async Task<AdminUserDetailDto> Handle(
@@ -69,6 +72,11 @@ internal sealed class GetAdminUserQueryHandler(
 
         var activeSessions = await sessions.ListActiveByHardwareIdsAsync(deviceIds, cancellationToken);
         var shareCounts = await shares.CountByHardwareIdsAsync(deviceIds, cancellationToken);
+
+        // Status is a projection over the last accepted share: running when it falls inside the
+        // activity window, idle otherwise. No status is stored.
+        var now = timeProvider.GetUtcNow();
+        var lastShareByDevice = await shares.GetLastShareAtByHardwareAsync(deviceIds, cancellationToken);
 
         var coinCodes = (await coins.ListAsync(cancellationToken))
             .ToDictionary(coin => coin.Id, coin => coin.Code);
@@ -87,9 +95,11 @@ internal sealed class GetAdminUserQueryHandler(
 
                 if (sessionsByDevice.TryGetValue(device.Id, out var active))
                 {
+                    var lastShareAt = lastShareByDevice.TryGetValue(device.Id, out var last) ? last : (DateTimeOffset?)null;
+
                     session = new AdminHardwareSessionDto(
                         active.Id,
-                        active.Status.ToDbValue(),
+                        MiningStatusProjection.Resolve(lastShareAt, now, miningOptions.ShareActivityWindowSeconds),
                         active.PoolId,
                         poolNames.GetValueOrDefault(active.PoolId, "—"),
                         active.CoinId,

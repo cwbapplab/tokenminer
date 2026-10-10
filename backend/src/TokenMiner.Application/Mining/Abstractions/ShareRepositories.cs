@@ -37,6 +37,14 @@ public interface IShareRepository
     Task<IReadOnlyDictionary<Guid, ShareStatusCounts>> CountByHardwareIdsAsync(
         IEnumerable<Guid> hardwareIds,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The most recent share time per device; a device with no shares is absent from the result.
+    /// This single value decides whether the device is running or idle.
+    /// </summary>
+    Task<IReadOnlyDictionary<Guid, DateTimeOffset>> GetLastShareAtByHardwareAsync(
+        IEnumerable<Guid> hardwareIds,
+        CancellationToken cancellationToken);
 }
 
 /// <summary>

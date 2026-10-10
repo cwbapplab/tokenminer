@@ -15,14 +15,6 @@ internal sealed class UserHardwareMinerConfiguration : IEntityTypeConfiguration<
         builder.Property(session => session.WorkerIdentifier).IsRequired().HasMaxLength(128);
         builder.HasIndex(session => session.WorkerIdentifier);
 
-        builder.Property(session => session.Status)
-            .IsRequired()
-            .HasMaxLength(32)
-            .HasConversion(
-                status => status.ToDbValue(),
-                value => MiningSessionStatusDbValues.FromDbValue(value));
-
-        builder.Property(session => session.PauseReason).HasMaxLength(64);
         builder.Property(session => session.StopReason).HasMaxLength(64);
 
         builder.Property(session => session.StartedAt).IsRequired();
@@ -48,13 +40,11 @@ internal sealed class UserHardwareMinerConfiguration : IEntityTypeConfiguration<
             .HasForeignKey(session => session.MiningAlgoId)
             .OnDelete(DeleteBehavior.Restrict);
 
-        // At most one in-flight session per device. Enforced by a partial unique index so
-        // stopped sessions accumulate freely as history.
+        // At most one open session per device. Enforced by a partial unique index so stopped
+        // sessions accumulate freely as history.
         builder.HasIndex(session => session.UserHardwareId)
             .IsUnique()
-            .HasFilter("status IN ('running', 'paused')");
-
-        builder.HasIndex(session => new { session.Status, session.LastActivityAt });
+            .HasFilter("stopped_at IS NULL");
     }
 }
 

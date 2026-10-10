@@ -19,54 +19,18 @@ public sealed class UserHardwareMinerTests
         Now);
 
     [Fact]
-    public void NewSession_IsRunning()
+    public void NewSession_IsOpen()
     {
         var session = CreateSession();
 
-        session.Status.Should().Be(MiningSessionStatus.Running);
         session.IsActive.Should().BeTrue();
         session.StartedAt.Should().Be(Now);
         session.LastActivityAt.Should().Be(Now);
-        session.PausedAt.Should().BeNull();
         session.StoppedAt.Should().BeNull();
     }
 
     [Fact]
-    public void Pause_TransitionsOnlyOnce()
-    {
-        var session = CreateSession();
-        var pausedAt = Now.AddMinutes(1);
-
-        session.Pause(MiningStopReasonDbValues.ConnectionFailure, pausedAt).Should().BeTrue();
-        session.Pause(MiningStopReasonDbValues.ConnectionFailure, pausedAt.AddMinutes(1)).Should().BeFalse();
-
-        session.Status.Should().Be(MiningSessionStatus.Paused);
-        session.PauseReason.Should().Be("connection-failure");
-        session.PausedAt.Should().Be(pausedAt);
-        session.IsActive.Should().BeTrue();
-    }
-
-    [Fact]
-    public void Resume_OnlyAppliesWhenPausedAndClearsTheReason()
-    {
-        var session = CreateSession();
-
-        // Not paused yet.
-        session.Resume(Now.AddMinutes(1)).Should().BeFalse();
-
-        session.Pause(MiningStopReasonDbValues.ConnectionFailure, Now.AddMinutes(1));
-        var resumedAt = Now.AddMinutes(2);
-
-        session.Resume(resumedAt).Should().BeTrue();
-
-        session.Status.Should().Be(MiningSessionStatus.Running);
-        session.PauseReason.Should().BeNull();
-        session.PausedAt.Should().BeNull();
-        session.LastActivityAt.Should().Be(resumedAt);
-    }
-
-    [Fact]
-    public void Stop_TransitionsFromRunningOrPausedExactlyOnce()
+    public void Stop_TransitionsFromOpenExactlyOnce()
     {
         var session = CreateSession();
         var stoppedAt = Now.AddMinutes(5);
@@ -74,7 +38,6 @@ public sealed class UserHardwareMinerTests
         session.Stop(MiningStopReasonDbValues.UserTriggered, stoppedAt).Should().BeTrue();
         session.Stop(MiningStopReasonDbValues.UserTriggered, stoppedAt.AddMinutes(1)).Should().BeFalse();
 
-        session.Status.Should().Be(MiningSessionStatus.Stopped);
         session.StopReason.Should().Be("user-triggered");
         session.StoppedAt.Should().Be(stoppedAt);
         session.IsActive.Should().BeFalse();
@@ -90,28 +53,12 @@ public sealed class UserHardwareMinerTests
 
         session.LastActivityAt.Should().Be(later);
         session.StartedAt.Should().Be(Now);
-        session.Status.Should().Be(MiningSessionStatus.Running);
+        session.IsActive.Should().BeTrue();
     }
 }
 
 public sealed class MiningSessionEnumTests
 {
-    [Theory]
-    [InlineData(MiningSessionStatus.Running, "running")]
-    [InlineData(MiningSessionStatus.Paused, "paused")]
-    [InlineData(MiningSessionStatus.Stopped, "stopped")]
-    public void SessionStatus_RoundTrips(MiningSessionStatus status, string expected)
-    {
-        status.ToDbValue().Should().Be(expected);
-        MiningSessionStatusDbValues.FromDbValue(expected).Should().Be(status);
-    }
-
-    [Fact]
-    public void ActiveStatusesAreRunningAndPaused()
-    {
-        MiningSessionStatusDbValues.Active.Should().BeEquivalentTo(["running", "paused"]);
-    }
-
     [Theory]
     [InlineData(MiningStopReason.ConnectionFailure, "connection-failure")]
     [InlineData(MiningStopReason.DriverCrash, "driver-crash")]

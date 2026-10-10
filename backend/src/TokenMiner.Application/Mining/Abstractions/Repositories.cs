@@ -1,5 +1,4 @@
 using TokenMiner.Domain.Mining;
-using TokenMiner.Domain.Mining.Enums;
 
 namespace TokenMiner.Application.Mining.Abstractions;
 
@@ -88,7 +87,7 @@ public interface IMiningSessionRepository
 {
     Task<UserHardwareMiner?> GetByIdAsync(Guid id, CancellationToken cancellationToken);
 
-    /// <summary>The single in-flight (running or paused) session for a device, if any.</summary>
+    /// <summary>The single open (not yet stopped) session for a device, if any.</summary>
     Task<UserHardwareMiner?> GetActiveByHardwareAsync(Guid userHardwareId, CancellationToken cancellationToken);
 
     /// <summary>
@@ -99,17 +98,13 @@ public interface IMiningSessionRepository
         string workerIdentifier,
         CancellationToken cancellationToken);
 
-    /// <summary>The in-flight (running or paused) sessions for the given devices.</summary>
+    /// <summary>The open (not yet stopped) sessions for the given devices.</summary>
     Task<IReadOnlyList<UserHardwareMiner>> ListActiveByHardwareIdsAsync(
         IEnumerable<Guid> hardwareIds,
         CancellationToken cancellationToken);
 
-    /// <summary>Running sessions whose last heartbeat is older than <paramref name="threshold"/>.</summary>
-    Task<IReadOnlyList<UserHardwareMiner>> ListRunningIdleSinceAsync(
-        DateTimeOffset threshold,
-        CancellationToken cancellationToken);
-
-    Task<int> CountByStatusAsync(MiningSessionStatus status, CancellationToken cancellationToken);
+    /// <summary>The open (running) sessions, for the operator status snapshot.</summary>
+    Task<IReadOnlyList<UserHardwareMiner>> ListActiveAsync(CancellationToken cancellationToken);
 
     void Add(UserHardwareMiner session);
 }

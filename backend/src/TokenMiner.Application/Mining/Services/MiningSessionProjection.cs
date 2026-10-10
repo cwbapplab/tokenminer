@@ -2,7 +2,6 @@ using System.Text.Json;
 using TokenMiner.Application.Common.Exceptions;
 using TokenMiner.Application.Mining.Models;
 using TokenMiner.Domain.Mining;
-using TokenMiner.Domain.Mining.Enums;
 
 namespace TokenMiner.Application.Mining.Services;
 
@@ -35,6 +34,7 @@ internal static class MiningSessionProjection
         PoolDetails poolDetails,
         Coin coin,
         MiningAlgo algorithm,
+        string status,
         MiningOptions options)
     {
         var publicStratumHost = RequirePublicStratumEndpoint(options);
@@ -88,7 +88,7 @@ internal static class MiningSessionProjection
             minerCommand,
             minerConfig,
             publicStratumHost,
-            session.Status.ToDbValue(),
+            status,
             session.StartedAt);
     }
 

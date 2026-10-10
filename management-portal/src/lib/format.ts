@@ -37,7 +37,7 @@ export function formatDate(value: string | null | undefined): string {
   return Number.isNaN(date.getTime()) ? '—' : dateFormatter.format(date);
 }
 
-/** Relative age, which is what matters for heartbeats and in-flight work. */
+/** Relative age, which is what matters for last-seen times and in-flight work. */
 export function formatRelative(value: string | null | undefined): string {
   if (!value) {
     return 'never';
@@ -158,7 +158,6 @@ export function statusTone(status: string | null | undefined): string {
     case 'processing':
     case 'broadcast':
     case 'awaiting_confirmations':
-    case 'paused':
       return 'warning';
 
     case 'failed':
@@ -166,6 +165,9 @@ export function statusTone(status: string | null | undefined): string {
     case 'disabled':
     case 'cancelled':
       return 'danger';
+
+    case 'idle':
+      return 'secondary';
 
     default:
       return 'secondary';

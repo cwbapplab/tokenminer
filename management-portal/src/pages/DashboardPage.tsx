@@ -196,7 +196,7 @@ export function DashboardPage() {
                   value={formatInt(status?.runningSessions)}
                   icon="activity"
                   tone="success"
-                  hint={status?.pausedSessions ? `${status.pausedSessions} paused` : 'No paused sessions'}
+                  hint={status?.idleSessions ? `${status.idleSessions} idle` : 'No idle sessions'}
                 />
                 <StatCell
                   label="Provider balance"

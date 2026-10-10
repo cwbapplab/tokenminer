@@ -245,7 +245,7 @@ export interface AdminUserDetail extends AdminUserSummary {
 
 export interface SystemStatus {
   runningSessions: number;
-  pausedSessions: number;
+  idleSessions: number;
   pendingShares: number;
   conversionsInFlight: number;
   providerDepositsInFlight: number;

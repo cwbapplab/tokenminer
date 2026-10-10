@@ -54,7 +54,7 @@ npm run tauri dev
 
 ```
 src/                React app (Tailwind, no UI kit)
-  lib/              api/auth/heartbeat/settings/miners/tauri adapters
+  lib/              api/auth/settings/miners/tauri adapters
   components/       Tailwind UI kit + app shell (Able Pro-style)
   pages/            Login, Dashboard, Miners, Analytics, Settings
 src-tauri/          Rust backend

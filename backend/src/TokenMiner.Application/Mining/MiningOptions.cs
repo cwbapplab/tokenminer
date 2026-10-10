@@ -5,17 +5,17 @@ public sealed class MiningOptions
 {
     public const string SectionName = "Mining";
 
-    /// <summary>How long a session may go without a heartbeat before the watchdog pauses it.</summary>
-    public int HeartbeatGraceSeconds { get; set; } = 10;
+    /// <summary>
+    /// How long a device may go without producing a share before it is reported as idle. Status is
+    /// derived from share activity, so this is the window that defines "actively mining".
+    /// </summary>
+    public int ShareActivityWindowSeconds { get; set; } = 120;
 
     /// <summary>
     /// Stratum endpoint clients should connect to, i.e. the proxy. When empty, generated miner
     /// commands point straight at the pool, bypassing the proxy.
     /// </summary>
     public string PublicStratumEndpoint { get; set; } = string.Empty;
-
-    /// <summary>How often the watchdog looks for stale sessions.</summary>
-    public int WatchdogIntervalSeconds { get; set; } = 5;
 
     /// <summary>How often the reward processor advances pending shares.</summary>
     public int ShareProcessorIntervalSeconds { get; set; } = 60;

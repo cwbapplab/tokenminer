@@ -146,7 +146,6 @@ public static class DependencyInjection
             services.AddScoped<IEmailSender, NullEmailSender>();
         }
 
-        services.AddHostedService<MiningSessionWatchdog>();
         services.AddHostedService<ShareRewardProcessorJob>();
         services.AddHostedService<MiningStatisticsRollupJob>();
         services.AddHostedService<PoolMonitorJob>();

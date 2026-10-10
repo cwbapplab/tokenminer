@@ -74,14 +74,6 @@ export interface StopMiningRequest {
   reason: StopMiningReason;
 }
 
-export interface MiningHeartbeatAck {
-  type: string;
-  sessionFound: boolean;
-  status: string | null;
-  resumed: boolean;
-  at: string;
-}
-
 // --- Analytics ------------------------------------------------------------------------------
 
 export interface HardwareAnalytics {

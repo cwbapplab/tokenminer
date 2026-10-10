@@ -25,7 +25,7 @@ independently retryable and idempotent.
 | `TokenMiner.Application` | Use cases (MediatR), ports, validators. No EF, no HTTP. |
 | `TokenMiner.Contracts` | Wire DTOs, shared with the client and the Rust proxy. |
 | `TokenMiner.Infrastructure` | EF Core, integrations, background jobs, secrets. |
-| `TokenMiner.Api` | ASP.NET Core host: endpoints, WebSocket, auth wiring. |
+| `TokenMiner.Api` | ASP.NET Core host: endpoints, auth wiring. |
 
 Related: [`../stratum-proxy`](../stratum-proxy) (Rust) and [`../deploy/nginx`](../deploy/nginx).
 
@@ -65,7 +65,7 @@ cd ../stratum-proxy && cargo test      # 37 tests
 | Area | Routes |
 |---|---|
 | Auth | `POST /api/auth/{register,verify-email,otp/request,otp/verify,google,login,refresh,logout}`, `GET /api/auth/me` |
-| Mining | `POST /api/mining/{start,stop}`, `WS /ws/mining`, `GET /api/analytics` |
+| Mining | `POST /api/mining/{start,stop}`, `GET /api/mining/session`, `GET /api/analytics` |
 | Internal (signed) | `POST /internal/mining/shares`, `GET /internal/stratum/{config,workers/{id}}` |
 | Admin: catalogue | `/api/admin/{coins,pools,mining-algos}` |
 | Admin: treasury | `/api/admin/{conversion-providers,conversion-routes,conversions,pool-payouts}` |
@@ -77,9 +77,7 @@ Admin routes require the `admin` role. Grant it by registering an account, setti
 
 ## Two authentication schemes
 
-- **Users** present a JWT access token (short-lived) with a rotating refresh token. The mining
-  WebSocket also accepts the token on the query string, because a browser-based client cannot set
-  headers on a WebSocket.
+- **Users** present a JWT access token (short-lived) with a rotating refresh token.
 - **Services** (the stratum proxy) sign each request: HMAC-SHA256 over
   `METHOD\nPATH\nTIMESTAMP\nNONCE\nSHA256(body)`, hex-encoded upper case, sent as
   `X-Service-Id`, `X-Timestamp`, `X-Nonce` and `X-Signature`. Verification runs in middleware
@@ -105,7 +103,7 @@ operator-editable) → `appsettings.json` → code defaults.
 | Section | Purpose |
 |---|---|
 | `Auth` | JWT signing, OTP policy, lockout, rate limits, bootstrap admins |
-| `Mining` | Heartbeat grace, watchdog and job cadences, service-auth secret, public stratum endpoint |
+| `Mining` | Share-activity window, job cadences, service-auth secret, public stratum endpoint |
 | `Treasury` | Pool monitor, coin prices, payout confirmation threshold, conversion adapters |
 | `Providers` | Balance/model/deposit cadences, confirmation threshold, top-up thresholds, simulated chain |
 
@@ -119,7 +117,7 @@ Each is a `PeriodicJob` — its own dependency-injection scope, and a failing ti
 swallowed so one bad run cannot kill the loop. They are hosted services because the set is small;
 the plan's durable job runner is the natural next step for the money-moving ones.
 
-`MiningSessionWatchdog` · `ShareRewardProcessorJob` · `MiningStatisticsRollupJob` · `PoolMonitorJob` ·
+`ShareRewardProcessorJob` · `MiningStatisticsRollupJob` · `PoolMonitorJob` ·
 `PayoutReconciliationJob` · `CoinPriceJob` · `ConversionJob` · `ProviderBalanceJob` ·
 `ModelCatalogSyncJob` · `ProviderDepositPipelineJob` · `AutoTopUpJob`
 

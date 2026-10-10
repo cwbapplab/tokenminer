@@ -95,7 +95,7 @@ internal sealed class StartMiningCommandHandler(
         sessions.Add(session);
 
         // Built before persisting: an unconfigured proxy endpoint refuses the start rather than
-        // leaving a half-created session behind.
+        // leaving a half-created session behind. A brand-new session has no shares yet, so it is idle.
         var sessionDto = MiningSessionProjection.Build(
             session,
             device,
@@ -103,6 +103,7 @@ internal sealed class StartMiningCommandHandler(
             poolDetails,
             coin,
             algorithm,
+            MiningStatusProjection.Idle,
             miningOptions);
 
         logs.Add(new MiningLog(

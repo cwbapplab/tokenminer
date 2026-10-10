@@ -36,15 +36,3 @@ public sealed record MiningSessionResponse(
 /// <c>miner-closed</c>, <c>user-triggered</c> or <c>unknown</c>.
 /// </summary>
 public sealed record StopMiningRequest(Guid HardwareId, string Reason);
-
-// --- WebSocket protocol (/ws/mining) -----------------------------------------------------
-
-/// <summary>Client heartbeat sent every few seconds while a device is mining.</summary>
-public sealed record MiningHeartbeatMessage(string Type, Guid HardwareId);
-
-public sealed record MiningHeartbeatAck(
-    string Type,
-    bool SessionFound,
-    string? Status,
-    bool Resumed,
-    DateTimeOffset At);

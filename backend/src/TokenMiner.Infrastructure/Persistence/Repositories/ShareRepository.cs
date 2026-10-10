@@ -91,6 +91,21 @@ internal sealed class ShareRepository(AppDbContext dbContext) : IShareRepository
             .Where(share => share.PoolId == poolId && share.RewardStatus == ShareRewardStatus.Accepted)
             .OrderBy(share => share.CreatedAt)
             .ToListAsync(cancellationToken);
+
+    public async Task<IReadOnlyDictionary<Guid, DateTimeOffset>> GetLastShareAtByHardwareAsync(
+        IEnumerable<Guid> hardwareIds,
+        CancellationToken cancellationToken)
+    {
+        var ids = hardwareIds.Distinct().ToList();
+
+        var rows = await dbContext.UserMiningShares
+            .Where(share => ids.Contains(share.UserHardwareId))
+            .GroupBy(share => share.UserHardwareId)
+            .Select(group => new { UserHardwareId = group.Key, LastShareAt = group.Max(share => share.CreatedAt) })
+            .ToListAsync(cancellationToken);
+
+        return rows.ToDictionary(row => row.UserHardwareId, row => row.LastShareAt);
+    }
 }
 
 internal sealed class MiningStatisticRepository(AppDbContext dbContext) : IMiningStatisticRepository

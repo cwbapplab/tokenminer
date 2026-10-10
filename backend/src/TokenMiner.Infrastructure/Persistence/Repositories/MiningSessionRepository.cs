@@ -1,7 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using TokenMiner.Application.Mining.Abstractions;
 using TokenMiner.Domain.Mining;
-using TokenMiner.Domain.Mining.Enums;
 
 namespace TokenMiner.Infrastructure.Persistence.Repositories;
 
@@ -15,7 +14,7 @@ internal sealed class MiningSessionRepository(AppDbContext dbContext) : IMiningS
         CancellationToken cancellationToken) =>
         dbContext.UserHardwareMiners.FirstOrDefaultAsync(
             session => session.UserHardwareId == userHardwareId
-                && (session.Status == MiningSessionStatus.Running || session.Status == MiningSessionStatus.Paused),
+                && session.StoppedAt == null,
             cancellationToken);
 
     public Task<UserHardwareMiner?> GetActiveByWorkerIdentifierAsync(
@@ -23,7 +22,7 @@ internal sealed class MiningSessionRepository(AppDbContext dbContext) : IMiningS
         CancellationToken cancellationToken) =>
         dbContext.UserHardwareMiners.FirstOrDefaultAsync(
             session => session.WorkerIdentifier == workerIdentifier
-                && (session.Status == MiningSessionStatus.Running || session.Status == MiningSessionStatus.Paused),
+                && session.StoppedAt == null,
             cancellationToken);
 
     public async Task<IReadOnlyList<UserHardwareMiner>> ListActiveByHardwareIdsAsync(
@@ -34,20 +33,14 @@ internal sealed class MiningSessionRepository(AppDbContext dbContext) : IMiningS
 
         return await dbContext.UserHardwareMiners
             .Where(session => ids.Contains(session.UserHardwareId)
-                && (session.Status == MiningSessionStatus.Running || session.Status == MiningSessionStatus.Paused))
+                && session.StoppedAt == null)
             .ToListAsync(cancellationToken);
     }
 
-    public async Task<IReadOnlyList<UserHardwareMiner>> ListRunningIdleSinceAsync(
-        DateTimeOffset threshold,
-        CancellationToken cancellationToken) =>
+    public async Task<IReadOnlyList<UserHardwareMiner>> ListActiveAsync(CancellationToken cancellationToken) =>
         await dbContext.UserHardwareMiners
-            .Where(session => session.Status == MiningSessionStatus.Running
-                && session.LastActivityAt < threshold)
+            .Where(session => session.StoppedAt == null)
             .ToListAsync(cancellationToken);
-
-    public Task<int> CountByStatusAsync(MiningSessionStatus status, CancellationToken cancellationToken) =>
-        dbContext.UserHardwareMiners.CountAsync(session => session.Status == status, cancellationToken);
 
     public void Add(UserHardwareMiner session) => dbContext.UserHardwareMiners.Add(session);
 }

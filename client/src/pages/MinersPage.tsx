@@ -7,7 +7,6 @@ import { useBackendLogs } from "../hooks/useBackendLogs";
 import { useToast } from "../components/Toast";
 import { onMinerLog, startSessionMiner, stopMiner } from "../lib/miners";
 import { startSession, stopSession, getSession } from "../lib/session";
-import { startHeartbeat, stopHeartbeat } from "../lib/heartbeat";
 import { loadSettings } from "../lib/settings";
 import { formatHashrate, formatPearlRate } from "../lib/utils";
 import type { MinerCommandParams, MinerKind, MinerStatus, MiningSession } from "../lib/types";
@@ -74,7 +73,6 @@ export function MinersPage() {
     return () => {
       disposed = true;
       detach?.();
-      stopHeartbeat();
     };
   }, []);
 
@@ -100,7 +98,6 @@ export function MinersPage() {
     setSession(created);
     setEngine(started.kind);
     setParams(started.params);
-    startHeartbeat();
     return started.kind;
   }
 
@@ -133,7 +130,6 @@ export function MinersPage() {
     try {
       if (running && engine) {
         await stopMiner(engine);
-        stopHeartbeat();
         try {
           await stopSession("user-triggered");
         } catch {

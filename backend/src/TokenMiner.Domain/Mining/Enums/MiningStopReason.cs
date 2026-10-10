@@ -1,7 +1,7 @@
 namespace TokenMiner.Domain.Mining.Enums;
 
 /// <summary>
-/// Why a mining session stopped or was paused. These values are part of the public API
+/// Why a mining session stopped. These values are part of the public API
 /// contract, so they use the documented hyphenated spelling rather than snake_case.
 /// </summary>
 public enum MiningStopReason

@@ -51,14 +51,6 @@ const KNOWN_KEYS: Record<string, { label: string; hint: string }> = {
     label: 'Minimum payout amount',
     hint: 'Smallest payout worth requesting from a pool.',
   },
-  ws_heartbeat_interval_seconds: {
-    label: 'WebSocket heartbeat interval',
-    hint: 'Seconds between miner heartbeats.',
-  },
-  ws_reconnect_grace_seconds: {
-    label: 'WebSocket reconnect grace',
-    hint: 'Seconds a dropped session may stay paused before being stopped.',
-  },
   auto_top_up_enabled: {
     label: 'Auto top-up enabled',
     hint: 'true or false. Turns the top-up state machine on and off.',

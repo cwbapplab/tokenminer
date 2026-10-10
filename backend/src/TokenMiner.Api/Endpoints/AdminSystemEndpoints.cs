@@ -24,7 +24,7 @@ public static class AdminSystemEndpoints
 
             return Results.Ok(new SystemStatusResponse(
                 status.RunningSessions,
-                status.PausedSessions,
+                status.IdleSessions,
                 status.PendingShares,
                 status.ConversionsInFlight,
                 status.ProviderDepositsInFlight,

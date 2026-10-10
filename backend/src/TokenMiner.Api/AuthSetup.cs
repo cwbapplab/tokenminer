@@ -39,27 +39,6 @@ public static class AuthSetup
                     NameClaimType = AuthClaimTypes.Subject,
                     RoleClaimType = AuthClaimTypes.Role,
                 };
-
-                options.Events = new JwtBearerEvents
-                {
-                    OnMessageReceived = context =>
-                    {
-                        // A browser-based client (including a Tauri webview) cannot attach an
-                        // Authorization header to a WebSocket, so accept the token on the query
-                        // string for the mining socket only.
-                        if (string.IsNullOrEmpty(context.Token)
-                            && context.HttpContext.Request.Path.StartsWithSegments("/ws/mining"))
-                        {
-                            var accessToken = context.Request.Query["access_token"];
-                            if (!string.IsNullOrEmpty(accessToken))
-                            {
-                                context.Token = accessToken;
-                            }
-                        }
-
-                        return Task.CompletedTask;
-                    },
-                };
             });
 
         services

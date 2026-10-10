@@ -16,10 +16,12 @@ public sealed record GetMiningSessionQuery(Guid UserId, Guid HardwareId) : IRequ
 internal sealed class GetMiningSessionQueryHandler(
     IUserHardwareRepository hardware,
     IMiningSessionRepository sessions,
+    IShareRepository shares,
     IPoolRepository pools,
     ICoinRepository coins,
     IMiningAlgoRepository algorithms,
-    MiningOptions miningOptions) : IRequestHandler<GetMiningSessionQuery, MiningSessionDto?>
+    MiningOptions miningOptions,
+    TimeProvider timeProvider) : IRequestHandler<GetMiningSessionQuery, MiningSessionDto?>
 {
     public async Task<MiningSessionDto?> Handle(
         GetMiningSessionQuery request,
@@ -52,6 +54,11 @@ internal sealed class GetMiningSessionQueryHandler(
             return null;
         }
 
+        // Status is derived from the device's last accepted share, not stored.
+        var now = timeProvider.GetUtcNow();
+        var lastShareByDevice = await shares.GetLastShareAtByHardwareAsync([device.Id], cancellationToken);
+        var lastShareAt = lastShareByDevice.TryGetValue(device.Id, out var last) ? last : (DateTimeOffset?)null;
+
         return MiningSessionProjection.Build(
             session,
             device,
@@ -59,6 +66,7 @@ internal sealed class GetMiningSessionQueryHandler(
             poolDetails,
             coin,
             algorithm,
+            MiningStatusProjection.Resolve(lastShareAt, now, miningOptions.ShareActivityWindowSeconds),
             miningOptions);
     }
 }

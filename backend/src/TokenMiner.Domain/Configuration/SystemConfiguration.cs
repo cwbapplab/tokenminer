@@ -46,7 +46,5 @@ public static class SystemConfigurationKeys
     public const string ProviderBalanceMinimum = "provider_balance_minimum";
     public const string MinimumConversionAmount = "minimum_conversion_amount";
     public const string MinimumPayoutAmount = "minimum_payout_amount";
-    public const string WsHeartbeatInterval = "ws_heartbeat_interval_seconds";
-    public const string WsReconnectGrace = "ws_reconnect_grace_seconds";
     public const string AutoTopUpEnabled = "auto_top_up_enabled";
 }

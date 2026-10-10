@@ -2,7 +2,7 @@ namespace TokenMiner.Contracts.System;
 
 public sealed record SystemStatusResponse(
     int RunningSessions,
-    int PausedSessions,
+    int IdleSessions,
     int PendingShares,
     int ConversionsInFlight,
     int ProviderDepositsInFlight,

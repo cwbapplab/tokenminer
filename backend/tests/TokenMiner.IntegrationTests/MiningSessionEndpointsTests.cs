@@ -1,12 +1,12 @@
 using System.Net;
 using System.Net.Http.Json;
-using System.Net.WebSockets;
-using System.Text.Json;
 using FluentAssertions;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using TokenMiner.Application.Mining.Sessions;
+using TokenMiner.Application.Mining.Shares;
+using TokenMiner.Contracts.Admin;
 using TokenMiner.Contracts.Auth;
 using TokenMiner.Contracts.Mining;
 using TokenMiner.Domain.Mining;
@@ -19,8 +19,6 @@ namespace TokenMiner.IntegrationTests;
 [Collection(ApiCollection.Name)]
 public sealed class MiningSessionEndpointsTests(ApiFactory factory)
 {
-    private static readonly JsonSerializerOptions WebJson = new(JsonSerializerDefaults.Web);
-
     private async Task<T> WithSenderAsync<T>(Func<ISender, Task<T>> action)
     {
         await using var scope = factory.Services.CreateAsyncScope();
@@ -43,22 +41,23 @@ public sealed class MiningSessionEndpointsTests(ApiFactory factory)
             .CountAsync(log => log.UserHardwareMinerId == sessionId && log.EventType == eventType);
     }
 
-    private async Task<MiningHeartbeatAck> SendHeartbeatAsync(string accessToken, Guid hardwareId)
+    /// <summary>Reports an accepted share for the device, the way the proxy does.</summary>
+    private async Task RecordShareAsync(Guid hardwareId, Guid poolId, Guid coinId)
     {
-        using var socket = await factory.Server
-            .CreateWebSocketClient()
-            .ConnectAsync(new Uri($"ws://localhost/ws/mining?access_token={accessToken}"), CancellationToken.None);
-
-        var payload = JsonSerializer.SerializeToUtf8Bytes(
-            new MiningHeartbeatMessage("heartbeat", hardwareId),
-            WebJson);
-
-        await socket.SendAsync(payload, WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
-
-        var buffer = new byte[4096];
-        var received = await socket.ReceiveAsync(buffer, CancellationToken.None);
-
-        return JsonSerializer.Deserialize<MiningHeartbeatAck>(buffer.AsSpan(0, received.Count), WebJson)!;
+        await WithSenderAsync(sender => sender.Send(new RecordShareCommand(
+            hardwareId.ToString("N"),
+            poolId,
+            coinId,
+            $"share-{Guid.NewGuid():N}",
+            JobId: "job-1",
+            Nonce: "nonce-1",
+            Extranonce: null,
+            Difficulty: 1.5m,
+            Target: "target",
+            ResultHash: "hash",
+            ShareTimestamp: DateTimeOffset.UtcNow,
+            CoinValue: null,
+            PoolResponse: null)));
     }
 
     // --- Start ---------------------------------------------------------------------------
@@ -78,7 +77,8 @@ public sealed class MiningSessionEndpointsTests(ApiFactory factory)
         response.StatusCode.Should().Be(HttpStatusCode.OK);
 
         var session = await response.Content.ReadFromJsonAsync<MiningSessionResponse>();
-        session!.Status.Should().Be("running");
+        // Status reflects share activity: a brand-new session has produced no shares, so it is idle.
+        session!.Status.Should().Be("idle");
         session.PoolId.Should().Be(setup.Pool.Id);
         session.CoinCode.Should().Be(setup.Coin.Code);
         session.AlgorithmCode.Should().Be(setup.Algo.Code);
@@ -100,7 +100,7 @@ public sealed class MiningSessionEndpointsTests(ApiFactory factory)
         session.MinerCommand.Should().BeEmpty();
 
         var stored = await ReadSessionAsync(session.SessionId);
-        stored.Status.Should().Be(MiningSessionStatus.Running);
+        stored.StoppedAt.Should().BeNull();
         stored.WorkerIdentifier.Should().Be(session.WorkerId);
         (await CountLogsAsync(session.SessionId, MiningEventType.MiningStarted)).Should().Be(1);
     }
@@ -220,6 +220,52 @@ public sealed class MiningSessionEndpointsTests(ApiFactory factory)
         response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
     }
 
+    // --- Share-driven status -------------------------------------------------------------
+
+    [Fact]
+    public async Task Session_IsIdleUntilAShareArrives_ThenRunning()
+    {
+        var client = await factory.CreateUserClientAsync();
+        var admin = await factory.CreateAdminClientAsync();
+        var setup = await MiningTestData.SeedAsync(admin);
+        var hardwareId = Guid.NewGuid();
+
+        await client.PostAsJsonAsync("/api/mining/start", new StartMiningRequest(hardwareId, setup.Pool.Id));
+
+        // No shares yet: the session is idle.
+        var before = (await client.GetFromJsonAsync<MiningSessionResponse>(
+            $"/api/mining/session?hardwareId={hardwareId}"))!;
+        before.Status.Should().Be("idle");
+
+        await RecordShareAsync(hardwareId, setup.Pool.Id, setup.Coin.Id);
+
+        // An accepted share inside the window makes it running.
+        var after = (await client.GetFromJsonAsync<MiningSessionResponse>(
+            $"/api/mining/session?hardwareId={hardwareId}"))!;
+        after.Status.Should().Be("running");
+    }
+
+    [Fact]
+    public async Task AdminUserDetail_TracksShareActivity()
+    {
+        var admin = await factory.CreateAdminClientAsync();
+        var userClient = await factory.CreateUserClientAsync();
+        var setup = await MiningTestData.SeedAsync(admin);
+        var hardwareId = Guid.NewGuid();
+
+        var profile = (await userClient.GetFromJsonAsync<UserProfileResponse>("/api/auth/me"))!;
+
+        await userClient.PostAsJsonAsync("/api/mining/start", new StartMiningRequest(hardwareId, setup.Pool.Id));
+
+        var idle = (await admin.GetFromJsonAsync<AdminUserDetailResponse>($"/api/admin/users/{profile.Id}"))!;
+        idle.Hardware.Single().ActiveSession!.Status.Should().Be("idle");
+
+        await RecordShareAsync(hardwareId, setup.Pool.Id, setup.Coin.Id);
+
+        var running = (await admin.GetFromJsonAsync<AdminUserDetailResponse>($"/api/admin/users/{profile.Id}"))!;
+        running.Hardware.Single().ActiveSession!.Status.Should().Be("running");
+    }
+
     // --- Stop ----------------------------------------------------------------------------
 
     [Fact]
@@ -244,7 +290,7 @@ public sealed class MiningSessionEndpointsTests(ApiFactory factory)
         second.StatusCode.Should().Be(HttpStatusCode.NoContent);
 
         var stored = await ReadSessionAsync(session.SessionId);
-        stored.Status.Should().Be(MiningSessionStatus.Stopped);
+        stored.StoppedAt.Should().NotBeNull();
         stored.StopReason.Should().Be("user-triggered");
         (await CountLogsAsync(session.SessionId, MiningEventType.MiningStopped)).Should().Be(1);
     }
@@ -259,84 +305,6 @@ public sealed class MiningSessionEndpointsTests(ApiFactory factory)
             new StopMiningRequest(Guid.NewGuid(), "because"));
 
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
-    }
-
-    // --- Liveness ------------------------------------------------------------------------
-
-    [Fact]
-    public async Task Heartbeat_OnAnActiveSession_IsAcknowledged()
-    {
-        var (client, accessToken) = await factory.CreateUserClientWithTokenAsync();
-        var admin = await factory.CreateAdminClientAsync();
-        var setup = await MiningTestData.SeedAsync(admin);
-        var hardwareId = Guid.NewGuid();
-
-        var start = await client.PostAsJsonAsync("/api/mining/start", new StartMiningRequest(hardwareId, setup.Pool.Id));
-        var session = (await start.Content.ReadFromJsonAsync<MiningSessionResponse>())!;
-
-        var ack = await SendHeartbeatAsync(accessToken, hardwareId);
-
-        ack.SessionFound.Should().BeTrue();
-        ack.Status.Should().Be("running");
-        ack.Resumed.Should().BeFalse();
-
-        var stored = await ReadSessionAsync(session.SessionId);
-        stored.Status.Should().Be(MiningSessionStatus.Running);
-    }
-
-    [Fact]
-    public async Task Heartbeat_WithoutASession_IsReportedAsNotFound()
-    {
-        var (_, accessToken) = await factory.CreateUserClientWithTokenAsync();
-
-        var ack = await SendHeartbeatAsync(accessToken, Guid.NewGuid());
-
-        ack.SessionFound.Should().BeFalse();
-        ack.Status.Should().BeNull();
-    }
-
-    [Fact]
-    public async Task IdleSession_IsPausedOnceAndResumesOnTheNextHeartbeat()
-    {
-        var (client, accessToken) = await factory.CreateUserClientWithTokenAsync();
-        var admin = await factory.CreateAdminClientAsync();
-        var setup = await MiningTestData.SeedAsync(admin);
-        var hardwareId = Guid.NewGuid();
-
-        var start = await client.PostAsJsonAsync("/api/mining/start", new StartMiningRequest(hardwareId, setup.Pool.Id));
-        var session = (await start.Content.ReadFromJsonAsync<MiningSessionResponse>())!;
-
-        // Simulate the client going quiet, then run the watchdog once.
-        await using (var scope = factory.Services.CreateAsyncScope())
-        {
-            var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var row = await dbContext.UserHardwareMiners.SingleAsync(candidate => candidate.Id == session.SessionId);
-            row.Touch(DateTimeOffset.UtcNow.AddMinutes(-5));
-            await dbContext.SaveChangesAsync();
-        }
-
-        var pausedCount = await WithSenderAsync(sender => sender.Send(new PauseStaleSessionsCommand(10)));
-        pausedCount.Should().Be(1);
-
-        var paused = await ReadSessionAsync(session.SessionId);
-        paused.Status.Should().Be(MiningSessionStatus.Paused);
-        paused.PauseReason.Should().Be("connection-failure");
-        (await CountLogsAsync(session.SessionId, MiningEventType.MiningPaused)).Should().Be(1);
-
-        // A second pass changes nothing, so one outage produces one pause event.
-        (await WithSenderAsync(sender => sender.Send(new PauseStaleSessionsCommand(10)))).Should().Be(0);
-        (await CountLogsAsync(session.SessionId, MiningEventType.MiningPaused)).Should().Be(1);
-
-        // The client reconnecting resumes the session.
-        var ack = await SendHeartbeatAsync(accessToken, hardwareId);
-        ack.SessionFound.Should().BeTrue();
-        ack.Resumed.Should().BeTrue();
-        ack.Status.Should().Be("running");
-
-        var resumed = await ReadSessionAsync(session.SessionId);
-        resumed.Status.Should().Be(MiningSessionStatus.Running);
-        resumed.PauseReason.Should().BeNull();
-        (await CountLogsAsync(session.SessionId, MiningEventType.MiningResumed)).Should().Be(1);
     }
 
     [Fact]

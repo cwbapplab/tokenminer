@@ -1,7 +1,9 @@
 using MediatR;
 using TokenMiner.Application.Common.Abstractions;
 using TokenMiner.Application.Configuration.Abstractions;
+using TokenMiner.Application.Mining;
 using TokenMiner.Application.Mining.Abstractions;
+using TokenMiner.Application.Mining.Services;
 using TokenMiner.Application.Providers;
 using TokenMiner.Application.Providers.Abstractions;
 using TokenMiner.Application.Providers.Commands;
@@ -156,7 +158,7 @@ internal sealed class ListSystemConfigurationsQueryHandler(ISystemConfigurationS
 /// <summary>An operational snapshot: what is in flight and what needs attention.</summary>
 public sealed record SystemStatusDto(
     int RunningSessions,
-    int PausedSessions,
+    int IdleSessions,
     int PendingShares,
     int ConversionsInFlight,
     int ProviderDepositsInFlight,
@@ -173,26 +175,41 @@ internal sealed class GetSystemStatusQueryHandler(
     IConversionRepository conversions,
     IProviderDepositRepository deposits,
     ILlmProviderRepository providers,
+    MiningOptions miningOptions,
     TimeProvider timeProvider) : IRequestHandler<GetSystemStatusQuery, SystemStatusDto>
 {
     public async Task<SystemStatusDto> Handle(
         GetSystemStatusQuery request,
         CancellationToken cancellationToken)
     {
+        var now = timeProvider.GetUtcNow();
+
         var activeProvider = (await providers.ListProvidersAsync(cancellationToken)).FirstOrDefault();
         var balance = activeProvider is null
             ? null
             : await providers.GetLatestBalanceAsync(activeProvider.Id, cancellationToken);
 
+        // Status is a projection over each device's last accepted share; no status is stored.
+        var activeSessions = await sessions.ListActiveAsync(cancellationToken);
+        var lastShareByDevice = await shares.GetLastShareAtByHardwareAsync(
+            activeSessions.Select(session => session.UserHardwareId),
+            cancellationToken);
+
+        var running = activeSessions.Count(session =>
+            MiningStatusProjection.Resolve(
+                lastShareByDevice.TryGetValue(session.UserHardwareId, out var last) ? last : null,
+                now,
+                miningOptions.ShareActivityWindowSeconds) == MiningStatusProjection.Running);
+
         return new SystemStatusDto(
-            await sessions.CountByStatusAsync(MiningSessionStatus.Running, cancellationToken),
-            await sessions.CountByStatusAsync(MiningSessionStatus.Paused, cancellationToken),
+            running,
+            activeSessions.Count - running,
             await shares.CountByStatusAsync(ShareRewardStatus.Pending, cancellationToken),
             await conversions.CountInFlightAsync(cancellationToken),
             await deposits.CountInFlightAsync(cancellationToken),
             balance?.Balance,
             balance?.ReservedBalance,
             balance?.CheckedAt,
-            timeProvider.GetUtcNow());
+            now);
     }
 }
