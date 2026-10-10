@@ -120,6 +120,7 @@ pub fn meets_target(jackpot_hash: &[u8; 32], bound: U256) -> bool {
 /// target re-encoded instead. Rounding up matters — a truncated mantissa
 /// encodes a *smaller* target, which would make the verification bound tighter
 /// than the one the search ran against, and drop shares the pool would take.
+#[cfg(test)]
 pub fn target_to_nbits(target: U256) -> Result<u32, String> {
     if target.is_zero() {
         return Err("The share target is zero.".into());

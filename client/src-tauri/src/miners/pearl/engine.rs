@@ -232,6 +232,13 @@ impl GpuMiner {
                         hits.push(more);
                     }
                     for hit in hits {
+                        // The device only reports a hit that clears the bound it was handed, but a
+                        // job whose difficulty has moved must not go out, so the host re-checks it
+                        // — the same guard llmjob's host makes (`pearlMiner._onHit`) for the cost
+                        // of a 256-bit compare. `bound` is the share bound `set_job` gave the core.
+                        if !target::meets_target(&hit.jackpot_hash, bound) {
+                            continue;
+                        }
                         if let Some(proof) = self.proof_for(&hit) {
                             self.pending_shares.push_back(proof);
                         }
@@ -259,8 +266,8 @@ impl GpuMiner {
     /// A hit the core reports but this refuses is not an error: a proof that
     /// will not verify at the pool is worth strictly less than no share at all,
     /// so the caller simply hands the next one up. `build_share_proof` does the
-    /// Merkle re-check and the leaf-index check; the driver runs the full
-    /// verifier on whatever this returns before it goes on the wire.
+    /// Merkle re-check and the leaf-index check, and that is the whole of the
+    /// pre-submit certification; the full verifier is not on the wire path.
     fn proof_for(&self, hit: &Hit) -> Option<PlainProof> {
         proof::build_share_proof(
             &self.job_key,

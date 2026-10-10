@@ -7,10 +7,13 @@
 //! certify. The proof therefore travels WITH the hit, already in flat
 //! concatenated buffers ([`super::abi::ProofSide`]).
 //!
-//! This module unpacks those into a [`PlainProof`] and re-checks the whole thing
-//! the way the pool will before it goes on the wire — the same job llmjob's
-//! `shareProof.js` + `plainProof.js` do, but built on the `zk-pow` /
-//! `pearl-blake3` types this client already mines and submits with.
+//! This module unpacks those into a [`PlainProof`] and re-checks them the way
+//! llmjob's `shareProof.js` + `plainProof.js` do — the Merkle roots against the
+//! job key, the leaf indices against the tile, then the wire encoding — built on
+//! the `pearl-blake3` types this client already mines and submits with.
+//! [`verify_share_locally`] goes further, to a full `zk-pow` verification, but it
+//! is the offline correctness gate — llmjob's `native/probes/verify-hits.js` — and
+//! not part of the submit path.
 //!
 //! The wire form is `base64(bincode(PlainProof))` with fixed-width little-endian
 //! integers. A 64-byte transcript is NOT a share — sending one earns
@@ -20,10 +23,17 @@
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use zk_pow::ffi::plain_proof::{MatrixMerkleProof, PlainProof};
+
+// Used only by `verify_share_locally`, the offline correctness gate, and the tests.
+#[cfg(test)]
 use primitive_types::U256;
+#[cfg(test)]
 use zk_pow::api::proof::{IncompleteBlockHeader, SeedDerivation};
+#[cfg(test)]
 use zk_pow::api::verify;
-use zk_pow::ffi::plain_proof::{CertificateVersion, MatrixMerkleProof, PlainProof};
+#[cfg(test)]
+use zk_pow::ffi::plain_proof::CertificateVersion;
 
 // Only `mining_configuration` (test-only) needs these.
 #[cfg(test)]
@@ -33,7 +43,9 @@ use zk_pow::ffi::plain_proof::list_to_pattern;
 
 use super::abi::ProofSide;
 use super::config::Profile;
-use super::target::{region_to_tile, target_to_nbits};
+use super::target::region_to_tile;
+#[cfg(test)]
+use super::target::target_to_nbits;
 
 /// One Merkle leaf: the operand bytes one proof chunk carries.
 pub const CHUNK_BYTES: usize = pearl_blake3::BLAKE3_CHUNK_LEN;
@@ -206,7 +218,8 @@ fn gzip_bytes(data: &[u8]) -> Result<Vec<u8>, String> {
     encoder.finish().map_err(|e| e.to_string())
 }
 
-/// Re-checks a proof the way the pool will, before it is submitted.
+/// Re-checks a proof the way the pool will — a full re-verification, the same
+/// depth as llmjob's `native/probes/verify-hits.js`.
 ///
 /// Deliberately not a block-difficulty check: no ordinary share meets the block
 /// target, so that would reject exactly the proofs we want to send. Instead the
@@ -214,10 +227,13 @@ fn gzip_bytes(data: &[u8]) -> Result<Vec<u8>, String> {
 /// which recomputes the jackpot from the committed matrices and compares it
 /// against that target.
 ///
-/// This is the only thing standing between a GPU bug and the wire. It is a full
-/// re-verification — the matrices, the noise, the jackpot and the Merkle proof —
-/// against the verifier the pool uses, so a proof that passes here is one the
-/// pool accepts.
+/// This is a correctness gate, not part of the submit path. It is an all-core
+/// `zk-pow` pass per share, so running it on every hit made the miner's CPU cost
+/// track its share rate. The submit path instead does what llmjob's own host does
+/// (`pearlMiner._onHit`): a share-bound comparison plus `build_share_proof`'s
+/// Merkle and leaf-index checks. The full verifier stays as the offline gate the
+/// ignored GPU tests run.
+#[cfg(test)]
 pub fn verify_share_locally(
     header: &IncompleteBlockHeader,
     cert_version: u32,
@@ -258,6 +274,7 @@ pub fn mining_configuration(profile: &Profile) -> Result<zk_pow::api::proof::Min
 /// Cert 3 is salted (llmjob's live path); everything older is legacy. The single
 /// version→derivation mapping lives in `zk_pow`, so this defers to it rather than
 /// re-deriving the rule.
+#[cfg(test)]
 fn seed_for(cert_version: u32) -> Result<SeedDerivation, String> {
     Ok(CertificateVersion::try_from(cert_version)
         .map_err(|e| e.to_string())?

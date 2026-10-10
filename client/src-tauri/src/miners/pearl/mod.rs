@@ -31,5 +31,5 @@ pub mod target;
 // an unused re-export is a warning that hides the next real one.
 pub use engine::GpuMiner;
 pub use frontdoor::{start, stop};
-pub use proof::{encode_plain_proof, verify_share_locally};
+pub use proof::encode_plain_proof;
 pub use target::share_search;

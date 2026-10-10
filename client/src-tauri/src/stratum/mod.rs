@@ -506,7 +506,7 @@ async fn run(
 fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
     use crate::miners::pearl::GpuMiner;
     use crate::miners::pearl_mining;
-    use crate::miners::pearl::{encode_plain_proof, share_search, verify_share_locally};
+    use crate::miners::pearl::{encode_plain_proof, share_search};
 
     std::thread::spawn(move || {
         let mining = config.mining.clone();
@@ -561,7 +561,7 @@ fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
             // Mine against the pool's share target rather than the block difficulty committed in
             // the header: a share is by definition easier than a block, so the block bound would
             // reject every candidate the pool accepts.
-            let (share_target, bound) = match share_search(&job.target, miner.profile()) {
+            let (_, bound) = match share_search(&job.target, miner.profile()) {
                 Ok(pair) => pair,
                 Err(error) => {
                     if unusable_job.as_deref() != Some(job.job_id.as_str()) {
@@ -636,17 +636,12 @@ fn spawn_miner(shared: Arc<Shared>, config: PrlConfig) {
                 continue;
             };
 
-            // The pool re-verifies everything we send. So do we, first — a proof that fails here
-            // is a bug in the GPU path, and submitting it would only burn pool goodwill.
-            if let Err(error) =
-                verify_share_locally(&header, cert_version, &proof, share_target)
-            {
-                shared.log(
-                    "error",
-                    format!("Mined proof failed local verification: {error}"),
-                );
-                continue;
-            }
+            // The proof is already certified before it is handed up: `search` drops any hit that no
+            // longer clears the job's share bound, and `build_share_proof` re-derives both Merkle
+            // roots against the job key and checks the leaf indices cover the tile. That is llmjob's
+            // own host-side check (`pearlMiner._onHit`). The pool's full verifier is deliberately not
+            // re-run here: it is an all-core `zk-pow` pass per share and catches only a fold or
+            // transcript bug, which llmjob does not catch locally either.
 
             let gzip = shared.gzip.load(Ordering::SeqCst);
             let encoded = match encode_plain_proof(&proof, gzip) {
