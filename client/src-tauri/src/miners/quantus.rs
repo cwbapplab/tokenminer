@@ -35,6 +35,8 @@ pub struct QuantusConfig {
     #[serde(default)]
     pub cuda_gpu: bool,
     #[serde(default)]
+    pub opencl_gpu: bool,
+    #[serde(default)]
     pub allow_integrated: bool,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
@@ -110,6 +112,7 @@ pub fn start(
         gpu_throttle_ms: 0,
         allow_integrated: config.allow_integrated,
         cuda_gpu: config.cuda_gpu,
+        opencl_gpu: config.opencl_gpu,
     };
 
     let miner_status = status.clone();
