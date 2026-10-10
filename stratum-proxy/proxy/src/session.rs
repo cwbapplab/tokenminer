@@ -69,9 +69,12 @@ pub async fn handle(stream: TcpStream, context: Arc<AppContext>) -> anyhow::Resu
     let pool_reader = BufReader::new(pool_read);
     let mut pool_writer = BufWriter::new(pool_write);
 
-    // Replay whatever the miner sent while we were deciding where to route it.
+    // Replay whatever the miner sent while we were deciding where to route it. The authorize is
+    // rewritten for the pool — its wallet is the routing key (possibly `address.coin`) and the pool
+    // wants `address.worker` — while every other line goes through unchanged.
     for line in &buffered {
-        protocol::write_line(&mut pool_writer, line).await?;
+        let line = rewrite_authorize(line, &route.upstream_username);
+        protocol::write_line(&mut pool_writer, &line).await?;
     }
 
     let pending: PendingSubmits = PendingSubmits::default();
@@ -86,10 +89,12 @@ pub async fn handle(stream: TcpStream, context: Arc<AppContext>) -> anyhow::Resu
     Ok(())
 }
 
-/// Where a connection goes and how its shares are attributed, resolved from the username alone.
+/// Where a connection goes and how its shares are attributed, resolved from the authorize alone.
 struct Route {
     endpoint: String,
     share: ShareContext,
+    /// The username the pool should see: `<address>.<worker>`.
+    upstream_username: String,
 }
 
 /// Validates the username against the in-memory configuration and returns the route. `Ok(None)`
@@ -159,6 +164,7 @@ where
             pool_id: pool.pool_id.clone(),
             coin_id: coin.coin_id.clone(),
         },
+        upstream_username: protocol::upstream_username(&identity.wallet, &identity.worker),
     }))
 }
 
@@ -191,6 +197,39 @@ fn request_id(line: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// Rewrites a `mining.authorize` so the pool sees `upstream_username` instead of the routing key
+/// the miner sent.
+///
+/// Named params get `wallet = upstream_username` and a blank `worker` — the pool reads the worker
+/// from the username, so leaving the separate field would either be ignored or, worse, appended a
+/// second time. A classic positional username replaces its first element. Every other line, and the
+/// id and remaining params, pass through unchanged.
+fn rewrite_authorize(line: &str, upstream_username: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+        return line.to_string();
+    };
+
+    if value.get("method").and_then(Value::as_str) != Some(METHOD_AUTHORIZE) {
+        return line.to_string();
+    }
+
+    match value.get_mut("params") {
+        Some(Value::Object(params)) => {
+            params.insert(
+                "wallet".to_string(),
+                Value::String(upstream_username.to_string()),
+            );
+            params.insert("worker".to_string(), Value::String(String::new()));
+        }
+        Some(Value::Array(params)) if !params.is_empty() => {
+            params[0] = Value::String(upstream_username.to_string());
+        }
+        _ => return line.to_string(),
+    }
+
+    value.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,15 +253,50 @@ mod tests {
 
     #[test]
     fn reads_the_identity_from_a_pearl_named_authorize() {
+        // The named form carries the wallet — a routing key that may be `address.coin` — and the
+        // worker as separate fields. The wallet is not split here.
         let line = format!(
-            r#"{{"id":1,"method":"mining.authorize","params":{{"wallet":"krxYR9NJVQ.kryptex-prl.{WORKER}","worker":""}}}}"#
+            r#"{{"id":1,"method":"mining.authorize","params":{{"wallet":"krxYR9NJVQ.prl","worker":"{WORKER}"}}}}"#
         );
 
         let identity = authorized_identity(&line).expect("an identity");
 
-        assert_eq!(identity.wallet, "krxYR9NJVQ");
-        assert_eq!(identity.pool.as_deref(), Some("kryptex-prl"));
+        assert_eq!(identity.wallet, "krxYR9NJVQ.prl");
+        assert!(identity.pool.is_none());
         assert_eq!(identity.worker, WORKER);
+    }
+
+    #[test]
+    fn rewrites_a_named_authorize_to_the_pool_username() {
+        let line = r#"{"id":1,"method":"mining.authorize","params":{"wallet":"krxYR9NJVQ.prl","worker":"rig1","pass":"x"}}"#;
+
+        let rewritten = rewrite_authorize(line, "krxYR9NJVQ.rig1");
+        let value: Value = serde_json::from_str(&rewritten).unwrap();
+
+        // The routing key's coin is dropped and the worker moved into the username.
+        assert_eq!(value["params"]["wallet"], json!("krxYR9NJVQ.rig1"));
+        assert_eq!(value["params"]["worker"], json!(""));
+        // The id and other params are untouched.
+        assert_eq!(value["id"], json!(1));
+        assert_eq!(value["params"]["pass"], json!("x"));
+    }
+
+    #[test]
+    fn rewrites_a_classic_authorize_username() {
+        let line = r#"{"id":2,"method":"mining.authorize","params":["krxYR9NJVQ.prl.rig1","x"]}"#;
+
+        let rewritten = rewrite_authorize(line, "krxYR9NJVQ.rig1");
+        let value: Value = serde_json::from_str(&rewritten).unwrap();
+
+        assert_eq!(value["params"][0], json!("krxYR9NJVQ.rig1"));
+        assert_eq!(value["params"][1], json!("x"));
+    }
+
+    #[test]
+    fn leaves_non_authorize_lines_untouched() {
+        let line = r#"{"id":3,"method":"mining.submit","params":{"job_id":"job-1"}}"#;
+
+        assert_eq!(rewrite_authorize(line, "krxYR9NJVQ.rig1"), line);
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! TokenMiner stratum proxy.
 //!
 //! Miners reach this service through nginx. For each connection the proxy identifies the worker,
-//! opens a connection to that worker's pool and relays stratum traffic verbatim in both
-//! directions. The only thing it *acts* on is an accepted share: at that point it reports the
-//! share to the API with a signed request. Rejected shares are relayed and forgotten.
+//! opens a connection to that worker's pool and relays stratum traffic in both directions. The
+//! miner's wallet is a routing key the pool must not see, so the `mining.authorize` is rewritten to
+//! `<address>.<worker>` on its way up; everything else passes through unchanged. The only other
+//! thing it *acts* on is an accepted share: at that point it reports the share to the API with a
+//! signed request. Rejected shares are relayed and forgotten.
 
 pub mod cache;
 pub mod config;

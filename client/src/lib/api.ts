@@ -16,11 +16,18 @@ export class ApiError extends Error {
 }
 
 /**
+ * A persisted token pair, plus the wall-clock instant the access token stops being accepted.
+ * The absolute instant is what lets the client refresh ahead of expiry across a reload; the
+ * relative `expiresIn` alone cannot be trusted once any time has passed.
+ */
+export type StoredTokens = AuthTokens & { expiresAt: number };
+
+/**
  * Where the access/refresh tokens live. The default is localStorage; in the desktop app
  * this is swapped for an OS-encrypted store once the Rust side is available.
  */
 export interface TokenStorage {
-  load(): AuthTokens | null;
+  load(): StoredTokens | null;
   save(tokens: AuthTokens): void;
   clear(): void;
 }
@@ -28,6 +35,7 @@ export interface TokenStorage {
 const ACCESS_KEY = "tokenminer.tokens.access";
 const REFRESH_KEY = "tokenminer.tokens.refresh";
 const EXPIRES_KEY = "tokenminer.tokens.expiresIn";
+const EXPIRES_AT_KEY = "tokenminer.tokens.expiresAt";
 
 export const localStorageTokenStorage: TokenStorage = {
   load() {
@@ -36,23 +44,37 @@ export const localStorageTokenStorage: TokenStorage = {
     if (!accessToken || !refreshToken) {
       return null;
     }
+    const expiresIn = Number(localStorage.getItem(EXPIRES_KEY) ?? "0");
+    const storedExpiry = Number(localStorage.getItem(EXPIRES_AT_KEY) ?? "0");
     return {
       accessToken,
       refreshToken,
-      expiresIn: Number(localStorage.getItem(EXPIRES_KEY) ?? "0"),
+      expiresIn,
+      // Sessions written before the absolute timestamp existed fall back to counting from
+      // now, rather than pinning the expiry at the epoch and forcing a spurious refresh.
+      expiresAt: storedExpiry > 0 ? storedExpiry : Date.now() + expiresIn * 1000,
     };
   },
   save(tokens) {
     localStorage.setItem(ACCESS_KEY, tokens.accessToken);
     localStorage.setItem(REFRESH_KEY, tokens.refreshToken);
     localStorage.setItem(EXPIRES_KEY, String(tokens.expiresIn));
+    localStorage.setItem(EXPIRES_AT_KEY, String(Date.now() + tokens.expiresIn * 1000));
   },
   clear() {
     localStorage.removeItem(ACCESS_KEY);
     localStorage.removeItem(REFRESH_KEY);
     localStorage.removeItem(EXPIRES_KEY);
+    localStorage.removeItem(EXPIRES_AT_KEY);
   },
 };
+
+/** Refresh this long before the access token expires, so a request never races the expiry. */
+const REFRESH_LEAD_MS = 60_000;
+/** Floor for the schedule: an already-expired token refreshes promptly, but not in a hot loop. */
+const MIN_REFRESH_DELAY_MS = 5_000;
+/** Backoff before retrying a refresh that could not reach the server. */
+const REFRESH_RETRY_MS = 30_000;
 
 type UnauthorizedHandler = () => void;
 
@@ -66,7 +88,9 @@ class ApiClient {
   private storage: TokenStorage = localStorageTokenStorage;
   private accessToken: string | null = null;
   private refreshToken: string | null = null;
+  private accessExpiresAt: number | null = null;
   private refreshInFlight: Promise<RefreshOutcome> | null = null;
+  private refreshTimer: number | null = null;
   private onUnauthorized: UnauthorizedHandler | null = null;
 
   constructor() {
@@ -82,6 +106,8 @@ class ApiClient {
     const tokens = this.storage.load();
     this.accessToken = tokens?.accessToken ?? null;
     this.refreshToken = tokens?.refreshToken ?? null;
+    this.accessExpiresAt = tokens?.expiresAt ?? null;
+    this.scheduleProactiveRefresh();
   }
 
   get hasSession(): boolean {
@@ -105,13 +131,75 @@ class ApiClient {
   setTokens(tokens: AuthTokens): void {
     this.accessToken = tokens.accessToken;
     this.refreshToken = tokens.refreshToken;
+    this.accessExpiresAt = Date.now() + tokens.expiresIn * 1000;
     this.storage.save(tokens);
+    this.scheduleProactiveRefresh();
   }
 
   clearTokens(): void {
     this.accessToken = null;
     this.refreshToken = null;
+    this.accessExpiresAt = null;
+    this.clearRefreshTimer();
     this.storage.clear();
+  }
+
+  /**
+   * Refreshes the access token if it is missing or close to expiring. Safe to call from any
+   * user-visible moment (window focus, wake from sleep, visibility change): it is a no-op
+   * while the token is still comfortable, and callers racing it share one refresh.
+   */
+  async ensureFreshAccessToken(): Promise<void> {
+    if (this.refreshToken === null) {
+      return;
+    }
+
+    const comfortable =
+      this.accessToken !== null &&
+      this.accessExpiresAt !== null &&
+      this.accessExpiresAt - Date.now() > REFRESH_LEAD_MS;
+    if (comfortable) {
+      return;
+    }
+
+    const outcome = await this.refresh();
+
+    if (outcome === "rejected") {
+      this.clearTokens();
+      this.onUnauthorized?.();
+    } else if (outcome === "unreachable") {
+      // Keep the session and retry shortly, rather than leaving the client with a dead token.
+      this.scheduleRefresh(REFRESH_RETRY_MS);
+    }
+  }
+
+  /**
+   * Refreshes ahead of the access token's expiry so a session that merely went idle does not
+   * have to be rescued by a rejected request. The timer is throttled while the window is
+   * hidden or the machine sleeps, which is what `ensureFreshAccessToken` covers on resume.
+   */
+  private scheduleProactiveRefresh(): void {
+    if (this.refreshToken === null || this.accessExpiresAt === null) {
+      this.clearRefreshTimer();
+      return;
+    }
+
+    const delayMs = Math.max(this.accessExpiresAt - Date.now() - REFRESH_LEAD_MS, MIN_REFRESH_DELAY_MS);
+    this.scheduleRefresh(delayMs);
+  }
+
+  private scheduleRefresh(delayMs: number): void {
+    this.clearRefreshTimer();
+    this.refreshTimer = window.setTimeout(() => {
+      void this.ensureFreshAccessToken();
+    }, delayMs);
+  }
+
+  private clearRefreshTimer(): void {
+    if (this.refreshTimer !== null) {
+      window.clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
   }
 
   get<T>(path: string): Promise<T> {

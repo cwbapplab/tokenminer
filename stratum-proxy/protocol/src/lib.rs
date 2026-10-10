@@ -1,8 +1,9 @@
 //! Stratum JSON-RPC line framing and message parsing.
 //!
-//! The proxy relays miner traffic verbatim; parsing exists so it can *observe* which worker is
-//! talking and which submissions were accepted. Anything that fails to parse is simply relayed
-//! unchanged, so an unusual pool dialect can never break the relay.
+//! The proxy relays miner traffic through; parsing exists so it can *observe* which worker is
+//! talking and which submissions were accepted, and so a `mining.authorize` can be rewritten to the
+//! username the pool expects. Anything that fails to parse is simply relayed unchanged, so an
+//! unusual pool dialect can never break the relay.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -205,19 +206,39 @@ pub fn authorize_wallet(params: &Value) -> Option<String> {
     })
 }
 
-/// A `mining.authorize` username split into `wallet.systemPoolId.worker`.
+/// A `mining.authorize` reduced to what the proxy routes on.
+///
+/// `wallet` is the routing key exactly as the client sent it — an address, or `address.coin` when
+/// one address is shared by several coins. It is **not** split here: reducing it to the address the
+/// pool sees is a separate step ([`upstream_username`]), and the middle-segment pool form only
+/// exists in the classic positional dialect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizeIdentity {
     pub wallet: String,
-    /// The pool named in the username, absent for a bare `wallet.worker`.
+    /// The pool named in a classic positional username, absent otherwise.
     pub pool: Option<String>,
-    /// The worker identity, `<userId>-<hardwareId>`.
+    /// The worker identity, exactly as the client sent it.
     pub worker: String,
 }
 
-/// Splits a username into wallet, pool and worker. The pool is the segments between the first and
-/// last dot, so `wallet.pool.worker` and `wallet.worker` both parse. The worker is opaque.
+/// Reads the wallet and worker from a `mining.authorize`.
+///
+/// Pearl's named form carries them as separate fields, so the wallet is taken verbatim (it may be
+/// `address.coin`) and the `worker` field is the worker. The classic positional form
+/// (`["wallet[.pool].worker", "x"]`) is split the way pools split it: wallet before the first dot,
+/// worker last, pool in between.
 pub fn parse_authorize(params: &Value) -> Option<AuthorizeIdentity> {
+    if let Some(object) = params.as_object() {
+        let wallet = object.get("wallet").and_then(Value::as_str)?;
+        let worker = object.get("worker").and_then(Value::as_str).unwrap_or_default();
+
+        return Some(AuthorizeIdentity {
+            wallet: wallet.to_string(),
+            pool: None,
+            worker: worker.to_string(),
+        });
+    }
+
     let username = authorize_username(params)?;
     let mut segments = username.split('.');
 
@@ -234,6 +255,22 @@ pub fn parse_authorize(params: &Value) -> Option<AuthorizeIdentity> {
     };
 
     Some(AuthorizeIdentity { wallet, pool, worker })
+}
+
+/// The username the pool should see: the wallet's address (everything before the first dot) joined
+/// to the worker.
+///
+/// A wallet qualified for routing (`address.coin`) drops the coin on the way out, so the pool
+/// stores the same worker name it would for a bare address. An empty worker leaves just the
+/// address.
+pub fn upstream_username(wallet: &str, worker: &str) -> String {
+    let address = wallet.split('.').next().unwrap_or(wallet);
+
+    if worker.is_empty() {
+        address.to_string()
+    } else {
+        format!("{address}.{worker}")
+    }
 }
 
 /// Extracts the worker identity from a stratum username of the form `wallet.worker`.
@@ -403,6 +440,27 @@ mod tests {
             authorize_username(&json!({ "wallet": "prl1paddr", "worker": "rig1" })).as_deref(),
             Some("prl1paddr.rig1")
         );
+    }
+
+    #[test]
+    fn a_named_authorize_keeps_the_wallet_key_and_the_worker_separate() {
+        // The wallet is a routing key that may itself contain a dot; it must not be split.
+        let identity = parse_authorize(&json!({ "wallet": "krxYR9NJVQ.prl", "worker": "rig1" }))
+            .expect("an identity");
+
+        assert_eq!(identity.wallet, "krxYR9NJVQ.prl");
+        assert!(identity.pool.is_none());
+        assert_eq!(identity.worker, "rig1");
+    }
+
+    #[test]
+    fn the_upstream_username_is_the_address_and_the_worker() {
+        // A routing-qualified wallet drops the coin on the way out.
+        assert_eq!(upstream_username("krxYR9NJVQ.prl", "rig1"), "krxYR9NJVQ.rig1");
+        // A bare wallet is unchanged.
+        assert_eq!(upstream_username("krxYR9NJVQ", "rig1"), "krxYR9NJVQ.rig1");
+        // No worker leaves just the address.
+        assert_eq!(upstream_username("krxYR9NJVQ.prl", ""), "krxYR9NJVQ");
     }
 
     #[test]

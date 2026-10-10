@@ -131,6 +131,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => api.setUnauthorizedHandler(null);
   }, []);
 
+  // An app left running in the tray, suspended by the OS, or hidden past the access token's
+  // lifetime comes back with a stale token. Refresh it as soon as the window is visible again
+  // so the user's next click does not have to be the thing that discovers the expiry.
+  useEffect(() => {
+    const onWake = () => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
+      void api.ensureFreshAccessToken();
+    };
+
+    window.addEventListener("focus", onWake);
+    document.addEventListener("visibilitychange", onWake);
+
+    return () => {
+      window.removeEventListener("focus", onWake);
+      document.removeEventListener("visibilitychange", onWake);
+    };
+  }, []);
+
   const signIn = useCallback(
     async (email: string, password: string) => {
       const response = await api.post<AuthTokens | PendingActivation>("/api/auth/login", { email, password });

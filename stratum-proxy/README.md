@@ -12,10 +12,13 @@ miner ──▶ nginx (TLS) ──▶ stratum proxy ──▶ pool
 ## What it does
 
 1. Accepts a connection and waits for `mining.authorize`.
-2. Reads the worker identity from the username (`wallet.worker`) and resolves it against the API.
-   A worker with no active session is refused, so the proxy never relays for an unknown device.
-3. Opens a connection to that worker's pool and relays every message **verbatim**, in both
-   directions. The miner still receives exactly what the pool sent.
+2. Reads the wallet (the routing key) and worker from the authorize and picks the pool from the
+   in-memory table. The wallet is unique per pool in the API's data — an address shared by several
+   coins is qualified as `address.coin` — so a duplicate is never ambiguous.
+3. Opens a connection to that pool and relays messages in both directions. The one transformation
+   is `mining.authorize`: the miner's wallet is a routing key the pool must not see, so its username
+   is rewritten to `<address>.<worker>` (the coin qualifier dropped) before it is forwarded.
+   Everything else, and everything coming back, passes through unchanged.
 4. Watches `mining.submit` requests and their replies. When the pool accepts a submission it
    reports the share to the API with a signed request. Rejected shares are relayed and dropped —
    nothing is reported.
@@ -25,30 +28,35 @@ to report accepted shares, both off the critical relay path.
 
 ## Coin dialects
 
-The relay is verbatim, so it carries any Stratum dialect unchanged; parsing exists only to observe
-the worker and the shares. Two dialects are recognised:
+The relay carries any Stratum dialect unchanged — parsing exists to observe the worker and the
+shares, and to normalise the authorize username. Two dialects are recognised:
 
 - **Classic** (positional): `mining.authorize ["wallet.worker","x"]` and
   `mining.submit [worker, jobId, extranonce2, ntime, nonce]`.
 - **Pearl** (named params, no `mining.subscribe`): `mining.authorize {"wallet":…,"worker":…}`
-  and `mining.submit {"job_id":…,"plain_proof":…}`.
+  and `mining.submit {"job_id":…,"plain_proof":…}`. The wallet is the routing key and the worker is
+  a separate field; both drive routing as sent, and only the upstream authorize is recomposed to
+  `address.worker`.
 
 A share's idempotency key is derived from the work — the nonce for classic, the `plain_proof` for
 Pearl — so re-submitting the same work collapses to one record.
 
 ## Routing
 
-The username carries everything the proxy needs, so it never calls the API before dialing a pool:
+The authorize carries everything the proxy needs, so it never calls the API before dialing a pool:
 
 ```
-wallet[.systemPoolId].worker      worker = <userId>-<hardwareId> (two canonical GUIDs)
+wallet          the pool's payout address, or `address.coin` when one address pays several coins
+worker          the device's hardware id in "N" form (32 hex chars)
 ```
 
-- **Pool** — if a `systemPoolId` segment is present it must name a pool in the routing table; if it
-  is omitted the pool is inferred from the wallet (which must then be unique to one pool).
-- **Worker** — always the last dot-segment, split at the fixed GUID boundary into the user id and
-  the hardware id used to attribute the share.
+- **Pool** — the wallet is the routing key and must match exactly one pool's payout address in the
+  routing table; the `address.coin` qualification disambiguates an address shared by several coins.
+- **Worker** — the worker field (or the last dot-segment of a classic username), used to attribute
+  the share.
 - **Endpoint** — taken from the routing table entry, in memory.
+- **Upstream username** — always rewritten to `<address>.<worker>`, so the pool sees the plain
+  address and the worker and never the coin qualifier.
 
 ## Wallet policy
 
