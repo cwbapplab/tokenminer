@@ -6,4 +6,4 @@
 	url = https://github.com/cwbapplab/pearl.git
 [submodule "vendor/llmjob"]
 	path = vendor/llmjob
-	url = https://github.com/cwbapplab/llmjob.git
+	url = https://github.com/cwbapplab/llmjob-fork
