@@ -11,6 +11,8 @@
 
 #include "pearl_ffi.h"
 
+#include <cuda_runtime.h>
+
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -138,7 +140,19 @@ int pearl_ffi_select_device(const PearlProfileFlat *p, int requested, char *name
     if (err && err_len) snprintf(err, err_len, "no profile supplied");
     return -1;
   }
-  return pearl_host_select_device(as_profile(p), requested, name, name_len, err, err_len);
+  const int index = pearl_host_select_device(as_profile(p), requested, name, name_len, err,
+                                             err_len);
+  if (index >= 0) {
+    // CUDA's default device schedule (cudaDeviceScheduleAuto) busy-waits when the
+    // process holds no more contexts than the machine has logical CPUs — one context
+    // on a 16-thread box — so `cudaEventSynchronize` on the search thread spins a
+    // whole core for the entire time the GPU is busy. Ask for a blocking wait
+    // instead. It must be set before the context exists (`pearl_host_create` makes
+    // it); once it does this returns an error we deliberately ignore, since the only
+    // consequence is that the spin stays.
+    (void)cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+  }
+  return index;
 }
 
 PearlFfiHandle *pearl_ffi_create(const PearlProfileFlat *p, int device, char *err,
